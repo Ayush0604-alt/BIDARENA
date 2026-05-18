@@ -1,0 +1,233 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>BIDArena — Real-Time Bidding Simulator</title>
+  <link rel="stylesheet" href="css/style.css" />
+</head>
+
+<body>
+
+  <!-- ═══════════════════════════════════════════ -->
+  <!--  NAV                                        -->
+  <!-- ═══════════════════════════════════════════ -->
+  <nav class="navbar">
+    <a class="nav-logo" href="#">BID<span>ARENA</span></a>
+    <div class="nav-right" id="nav-user-wrap"></div>
+  </nav>
+
+  <!-- Points Bar -->
+  <div id="points-bar-wrap" style="display:none; height: 4px; background: var(--bg4); width: 100%;">
+    <div id="points-bar-fill"
+      style="height: 100%; background: var(--green); width: 100%; transition: width 0.3s, background 0.3s;"></div>
+  </div>
+
+  <!-- Winner Banner -->
+  <div id="winner-banner" class="winner-banner"></div>
+
+  <!-- ═══════════════════════════════════════════ -->
+  <!--  PAGE: AUTH                                 -->
+  <!-- ═══════════════════════════════════════════ -->
+  <div class="page active" id="page-auth">
+    <div class="auth-wrap">
+      <div class="auth-box">
+        <div class="auth-title" id="auth-title">SIGN IN</div>
+        <div class="auth-sub">ENTER THE ARENA</div>
+
+        <div class="auth-error" id="auth-error"></div>
+
+        <form id="auth-form">
+          <div class="form-group" id="auth-name-group" style="display:none;">
+            <label class="form-label">Full Name</label>
+            <input class="form-input" type="text" id="auth-name" placeholder="Your name" />
+          </div>
+          <div class="form-group">
+            <label class="form-label">Email</label>
+            <input class="form-input" type="email" id="auth-email" placeholder="you@example.com" required />
+          </div>
+          <div class="form-group">
+            <label class="form-label">Password</label>
+            <input class="form-input" type="password" id="auth-password" placeholder="••••••••" required />
+          </div>
+          <div class="form-group" id="auth-role-group" style="display:none;">
+            <label class="form-label">Role</label>
+            <select class="form-input" id="auth-role">
+              <option value="buyer">Buyer (Bidder)</option>
+              <option value="admin">Admin (Host)</option>
+            </select>
+          </div>
+          <button class="btn btn-gold btn-lg" type="submit" id="auth-submit" style="width:100%;justify-content:center;">
+            ENTER ARENA
+          </button>
+        </form>
+
+        <div class="auth-toggle">
+          <span id="auth-toggle-text">New here?</span>
+          <a id="auth-toggle-link">Create account</a>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ═══════════════════════════════════════════ -->
+  <!--  PAGE: LOBBY                               -->
+  <!-- ═══════════════════════════════════════════ -->
+  <div class="page" id="page-lobby">
+    <div class="lobby-header">
+      <div>
+        <div class="lobby-title">AUCTION ROOMS</div>
+        <div style="font-family:var(--mono);font-size:11px;color:var(--text-dim);margin-top:4px;letter-spacing:2px;">
+          CHOOSE A ROOM TO ENTER
+        </div>
+      </div>
+      <div style="display:flex;gap:10px;align-items:center;">
+        <button class="btn btn-ghost" onclick="loadRooms()">↺ REFRESH</button>
+        <button class="btn btn-gold" id="create-room-btn" onclick="openCreateRoomModal()" style="display:none;">
+          + CREATE ROOM
+        </button>
+      </div>
+    </div>
+    <div class="lobby-grid" id="rooms-grid">
+      <div style="color:var(--text-dim);font-family:var(--mono);font-size:13px;">Loading rooms...</div>
+    </div>
+  </div>
+
+  <!-- ═══════════════════════════════════════════ -->
+  <!--  PAGE: ARENA                               -->
+  <!-- ═══════════════════════════════════════════ -->
+  <div class="page" id="page-arena" style="flex:1;">
+    <!-- Arena Header -->
+    <div class="arena-header">
+      <span class="arena-back" onclick="backToLobby()">← LOBBY</span>
+      <div class="arena-room-name" id="arena-room-name">Room</div>
+      <div class="room-status" id="arena-room-status"></div>
+      <div style="margin-left:auto;display:flex;gap:10px;align-items:center;">
+        <button class="btn btn-outline" id="admin-dashboard-btn" onclick="openAdminDashboard()" style="display:none;">
+          📊 DASHBOARD
+        </button>
+        <button class="btn btn-outline" id="admin-add-item-btn" onclick="openAddItemModal()" style="display:none;">
+          + ADD ITEM
+        </button>
+        <button class="btn btn-danger" id="admin-reveal-btn" onclick="adminRevealPrices()" style="display:none;">
+          🔓 REVEAL PRICES
+        </button>
+        <div class="ws-indicator" id="ws-dot" title="WebSocket"></div>
+      </div>
+    </div>
+
+    <!-- Arena Body -->
+    <div class="arena-layout" style="flex:1;overflow:hidden;">
+      <!-- Main: Items -->
+      <div class="arena-main">
+        <div id="items-container" class="item-grid"></div>
+        <!-- Results section (shown after reveal) -->
+        <div id="results-section" style="display:none;"></div>
+      </div>
+
+      <!-- Sidebar -->
+      <div class="arena-sidebar" id="arena-sidebar">
+        <!-- Leaderboard -->
+        <div class="sidebar-section" style="flex: 1; overflow-y: auto; display: flex; flex-direction: column;">
+          <div class="sidebar-title">LEADERBOARD</div>
+          <div class="leaderboard-list" id="leaderboard-list">
+            <div style="color:var(--text-mute);font-family:var(--mono);font-size:11px;">Waiting for bids...</div>
+          </div>
+        </div>
+
+        <!-- Activity feed -->
+        <div class="sidebar-section" style="flex: 1; display: flex; flex-direction: column; overflow: hidden;">
+          <div class="sidebar-title">LIVE FEED</div>
+          <div class="feed-wrap" id="activity-feed"></div>
+        </div>
+      </div>
+    </div>
+
+    <button id="mobile-sidebar-toggle" class="btn btn-gold" onclick="toggleMobileSidebar()">📊</button>
+  </div>
+
+  <!-- ═══════════════════════════════════════════ -->
+  <!--  MODAL: CREATE ROOM                        -->
+  <!-- ═══════════════════════════════════════════ -->
+  <div class="modal-overlay" id="create-room-modal">
+    <div class="modal">
+      <div class="modal-title">CREATE ROOM</div>
+      <div class="form-group">
+        <label class="form-label">Room Name</label>
+        <input class="form-input" type="text" id="room-name-input" placeholder="e.g. Sunday Auction #1" />
+      </div>
+      <div class="modal-actions">
+        <button class="btn btn-ghost" onclick="closeCreateRoomModal()">CANCEL</button>
+        <button class="btn btn-gold" onclick="submitCreateRoom()">CREATE</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- ═══════════════════════════════════════════ -->
+  <!--  MODAL: ADD ITEM                           -->
+  <!-- ═══════════════════════════════════════════ -->
+  <div class="modal-overlay" id="add-item-modal">
+    <div class="modal">
+      <div class="modal-title">ADD ITEM</div>
+      <div class="form-group">
+        <label class="form-label">Item Name</label>
+        <input class="form-input" type="text" id="item-name-input" placeholder="e.g. Vintage Watch" />
+      </div>
+      <div class="form-group">
+        <label class="form-label">Description (optional)</label>
+        <input class="form-input" type="text" id="item-desc-input" placeholder="Short description..." />
+      </div>
+      <div class="form-group">
+        <label class="form-label">Actual Price (₹) — kept secret</label>
+        <input class="form-input" type="number" id="item-price-input" placeholder="5000" min="1" step="0.01" />
+      </div>
+      <div class="form-group">
+        <label class="form-label">Display Order</label>
+        <input class="form-input" type="number" id="item-order-input" placeholder="1" min="1" />
+      </div>
+      <div class="modal-actions">
+        <button class="btn btn-ghost" onclick="closeAddItemModal()">CANCEL</button>
+        <button class="btn btn-gold" onclick="submitAddItem()">ADD ITEM</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- ═══════════════════════════════════════════ -->
+  <!--  MODAL: ADMIN DASHBOARD                    -->
+  <!-- ═══════════════════════════════════════════ -->
+  <div class="modal-overlay" id="admin-dashboard-modal">
+    <div class="modal" style="max-width: 600px;">
+      <div class="modal-title">ADMIN DASHBOARD</div>
+      <div style="display:flex;gap:20px;margin-bottom:20px;">
+        <div class="card" style="flex:1;padding:16px;">
+          <div class="card-sub">TOTAL PLAYERS</div>
+          <div style="font-size:24px;color:var(--gold);" id="dash-total-players">0</div>
+        </div>
+        <div class="card" style="flex:1;padding:16px;">
+          <div class="card-sub">ACTIVE ITEM</div>
+          <div style="font-size:18px;color:var(--text);" id="dash-active-item">None</div>
+        </div>
+      </div>
+
+      <div class="card-sub" style="margin-bottom:10px;">PLAYER POINTS BALANCE</div>
+      <div id="dash-players-list"
+        style="max-height:200px;overflow-y:auto;background:var(--bg3);border:1px solid var(--border);border-radius:4px;padding:8px;">
+      </div>
+
+      <div class="modal-actions" style="margin-top:24px;justify-content:space-between;">
+        <button class="btn btn-danger" onclick="adminResetPoints()">⚠️ RESET ALL TO 10,000 PTS</button>
+        <button class="btn btn-ghost" onclick="closeAdminDashboard()">CLOSE</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- ═══════════════════════════════════════════ -->
+  <!--  TOAST CONTAINER                           -->
+  <!-- ═══════════════════════════════════════════ -->
+  <div class="toast-container" id="toast-container"></div>
+
+  <script src="js/app.js"></script>
+</body>
+
+</html>
