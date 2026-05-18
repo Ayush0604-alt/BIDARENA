@@ -7,10 +7,12 @@ const cookieParser = require("cookie-parser");
 
 const app = express();
 
-app.use(helmet());
+app.use(helmet({
+  contentSecurityPolicy: false,
+}));
 app.use(morgan("dev"));
 app.use(cors({
-  origin: "*", // Relaxed for Render deployment
+  origin: true, // Allow Render deployment seamlessly
   credentials: true
 }));
 app.use(express.json());
