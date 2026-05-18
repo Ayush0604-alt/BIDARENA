@@ -83,12 +83,34 @@ const deleteItem = async (req, res, next) => {
 // GET /api/v1/rooms/:id/leaderboard
 const getLeaderboard = async (req, res, next) => {
   try {
-    const { rows } = await pool.query(
-      `SELECT u.id, u.name, rp.total_spent, rp.items_won
-       FROM room_participants rp JOIN users u ON u.id=rp.user_id
-       WHERE rp.room_id=$1 ORDER BY rp.items_won DESC, rp.total_spent ASC LIMIT 10`,
-      [req.params.id]
-    );
+    const { id: roomId } = req.params;
+    const { rows: room } = await pool.query("SELECT status FROM rooms WHERE id=$1", [roomId]);
+    const isFinished = room[0]?.status === "finished";
+
+    let rows;
+    if (isFinished) {
+      const result = await pool.query(
+        `SELECT u.id, u.name, rp.total_spent, rp.items_won,
+                (10000 - rp.total_spent + COALESCE((
+                   SELECT SUM(actual_price) FROM items WHERE room_id=$1 AND winner_id=u.id
+                ), 0)) as net_worth
+         FROM room_participants rp JOIN users u ON u.id=rp.user_id
+         WHERE rp.room_id=$1 AND rp.is_spectator = FALSE
+         ORDER BY net_worth DESC LIMIT 10`,
+        [roomId]
+      );
+      rows = result.rows;
+    } else {
+      const result = await pool.query(
+        `SELECT u.id, u.name, rp.total_spent, rp.items_won,
+                (10000 - rp.total_spent) as net_worth
+         FROM room_participants rp JOIN users u ON u.id=rp.user_id
+         WHERE rp.room_id=$1 AND rp.is_spectator = FALSE
+         ORDER BY net_worth DESC LIMIT 10`,
+        [roomId]
+      );
+      rows = result.rows;
+    }
     res.json({ success: true, leaderboard: rows });
   } catch (err) { next(err); }
 };

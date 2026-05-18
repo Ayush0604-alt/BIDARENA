@@ -187,7 +187,8 @@ async function handlePlaceBid(ws, msg) {
     "SELECT MAX(amount) as max FROM bids WHERE item_id=$1",
     [itemId]
   );
-  const currentHigh = parseFloat(highRows[0]?.max || 0);
+  const currentHighDB = parseFloat(highRows[0]?.max || 0);
+  const currentHigh = Math.max(currentHighDB, window?.amount || 0);
   
   if (parseFloat(amount) < 1) {
     return ws.send(JSON.stringify({ type: "BID_REJECTED", reason: "Minimum bid is 1 point" }));
@@ -366,16 +367,36 @@ async function broadcastLeaderboard(roomId) {
 }
 
 async function getLeaderboard(roomId) {
-  const { rows } = await pool.query(
-    `SELECT u.id, u.name, rp.total_spent, rp.items_won
-     FROM room_participants rp
-     JOIN users u ON u.id = rp.user_id
-     WHERE rp.room_id = $1 AND rp.is_spectator = FALSE
-     ORDER BY rp.items_won DESC, rp.total_spent ASC
-     LIMIT 10`,
-    [roomId]
-  );
-  return rows;
+  const { rows: room } = await pool.query("SELECT status FROM rooms WHERE id=$1", [roomId]);
+  const isFinished = room[0]?.status === "finished";
+
+  if (isFinished) {
+    const { rows } = await pool.query(
+      `SELECT u.id, u.name, rp.total_spent, rp.items_won,
+              (10000 - rp.total_spent + COALESCE((
+                 SELECT SUM(actual_price) FROM items WHERE room_id=$1 AND winner_id=u.id
+              ), 0)) as net_worth
+       FROM room_participants rp
+       JOIN users u ON u.id = rp.user_id
+       WHERE rp.room_id = $1 AND rp.is_spectator = FALSE
+       ORDER BY net_worth DESC
+       LIMIT 10`,
+      [roomId]
+    );
+    return rows;
+  } else {
+    const { rows } = await pool.query(
+      `SELECT u.id, u.name, rp.total_spent, rp.items_won,
+              (10000 - rp.total_spent) as net_worth
+       FROM room_participants rp
+       JOIN users u ON u.id = rp.user_id
+       WHERE rp.room_id = $1 AND rp.is_spectator = FALSE
+       ORDER BY net_worth DESC
+       LIMIT 10`,
+      [roomId]
+    );
+    return rows;
+  }
 }
 
 async function sendWinnerEmail(winnerId, itemId, amount) {

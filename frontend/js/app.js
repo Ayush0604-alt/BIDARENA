@@ -744,15 +744,15 @@ async function openAdminDashboard() {
   
   // Players list
   const list = $("dash-players-list");
-  const maxPts = Math.max(...leaderboard.map(p => 10000 - p.total_spent), 1);
+  const maxPts = Math.max(...leaderboard.map(p => parseFloat(p.net_worth)), 1);
   list.innerHTML = leaderboard.map(p => {
-    const pts = 10000 - p.total_spent;
+    const pts = parseFloat(p.net_worth);
     const pct = Math.max(0, (pts / maxPts) * 100);
     return `
     <div style="margin-bottom:8px;">
       <div style="display:flex; justify-content:space-between; margin-bottom:4px;">
         <span style="font-family:var(--mono);font-size:12px;">${escapeHTML(p.name)}</span>
-        <span style="color:var(--gold);font-family:var(--mono);font-size:12px;">⚡ ${parseFloat(pts).toFixed(0)} pts</span>
+        <span style="color:var(--gold);font-family:var(--mono);font-size:12px;">⚡ ${pts.toFixed(0)} pts</span>
       </div>
       <div style="height:4px; background:var(--bg4); border-radius:2px; overflow:hidden;">
         <div style="height:100%; width:${pct}%; background:var(--gold);"></div>
@@ -840,7 +840,7 @@ function renderLeaderboard() {
         <div class="lb-name">${p.name}</div>
         <div class="lb-score">
           <div class="lb-won">${p.items_won} won</div>
-          <div>${formatCurrency(p.total_spent)}</div>
+          <div style="color:var(--gold);">⚡ ${parseFloat(p.net_worth).toFixed(0)} pts</div>
         </div>
       </div>
     `;
