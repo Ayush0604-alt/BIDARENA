@@ -22,13 +22,13 @@ app.use("/api/v1/rooms", require("./routes/room.routes"));
 
 app.get("/health", (req, res) => res.json({ status: "ok" }));
 
-// Error handler
-app.use(require("./middleware/error.middleware"));
-
 // Serve Frontend
 app.use(express.static(path.join(__dirname, "../../frontend")));
-app.get("*", (req, res) => {
+app.use((req, res) => {
   res.sendFile(path.join(__dirname, "../../frontend/index.html"));
 });
+
+// Error handler
+app.use(require("./middleware/error.middleware"));
 
 module.exports = app;
