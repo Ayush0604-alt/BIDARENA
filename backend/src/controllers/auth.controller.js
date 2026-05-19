@@ -12,11 +12,7 @@ const registerUser = async (req, res, next) => {
 
     // Only one admin allowed globally
     const requestedRole = role === "admin" ? "admin" : "buyer";
-    if (requestedRole === "admin") {
-      const { rows: admins } = await pool.query("SELECT id FROM users WHERE role='admin'");
-      if (admins.length > 0)
-        return res.status(400).json({ success: false, message: "An admin already exists. Only one admin is allowed." });
-    }
+    
 
     const salt = await bcrypt.genSalt(10);
     const hashedPassword = await bcrypt.hash(password, salt);
