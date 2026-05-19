@@ -23,23 +23,42 @@ function broadcastAll(data) {
 }
 
 function createTransporter() {
+  // Support both SMTP_* and EMAIL_* env var naming (render.yaml uses EMAIL_*)
   const host = process.env.SMTP_HOST || process.env.EMAIL_HOST;
   const port = Number(process.env.SMTP_PORT || process.env.EMAIL_PORT || 587);
   const user = process.env.SMTP_USER || process.env.EMAIL_USER;
   const pass = process.env.SMTP_PASS || process.env.EMAIL_PASS;
 
   if (!host || !user || !pass) {
-    console.warn("⚠️  Email not configured — set SMTP_HOST, SMTP_USER, SMTP_PASS in .env");
+    console.warn("⚠️  Email not configured — set SMTP_HOST/EMAIL_HOST, SMTP_USER/EMAIL_USER, SMTP_PASS/EMAIL_PASS in .env");
     return null;
   }
 
-  return nodemailer.createTransport({
+  const transport = nodemailer.createTransport({
     host,
     port,
     secure: port === 465,
     auth: { user, pass },
     tls: { rejectUnauthorized: false },
   });
+
+  // Verify connection on startup (non-fatal)
+  transport.verify((err) => {
+    if (err) {
+      console.error("⚠️  SMTP verify failed:", err.message);
+    } else {
+      console.log("✅ SMTP ready");
+    }
+  });
+
+  return transport;
+}
+
+// Lazy singleton transporter so verify runs once
+let _transporter = null;
+function getTransporter() {
+  if (!_transporter) _transporter = createTransporter();
+  return _transporter;
 }
 
 function setupWebSocket(server) {
@@ -107,6 +126,7 @@ async function handleJoinRoom(ws, roomId) {
   ws.roomId = roomId;
   if (!roomClients[roomId]) roomClients[roomId] = new Set();
 
+  // Close duplicate connections for the same user
   for (const client of roomClients[roomId]) {
     if (String(client.userId) === String(ws.userId) && client !== ws) {
       client.send(JSON.stringify({ type: "ERROR", reason: "Joined from another tab" }));
@@ -118,7 +138,7 @@ async function handleJoinRoom(ws, roomId) {
 
   const { rows: room } = await pool.query("SELECT * FROM rooms WHERE id=$1", [roomId]);
 
-  // Admin is NEVER a participant — skip inserting them into room_participants
+  // FIX 1: Admin is NEVER a participant — skip inserting them into room_participants
   if (ws.userRole !== "admin") {
     const isSpectator = room[0]?.status !== "waiting";
     await pool.query(
@@ -161,12 +181,12 @@ async function handleJoinRoom(ws, roomId) {
 
 // ─── BIDDING MODEL ───────────────────────────────────────────────────────────
 // Multiple buyers can hold live bids simultaneously on an active item.
-// Each buyer can withdraw at any time (points refunded).
+// Each buyer can WITHDRAW their bid at any time (points refunded).
 // When only 1 bidder remains after a withdrawal → 5-second grace period → auto-close.
-// Admin can also force-end (highest active bidder wins, others refunded).
+// Admin can force-end at any time (highest active bidder wins, others refunded).
 // ─────────────────────────────────────────────────────────────────────────────
 
-// activeBidWindows: itemId => { activeBidders: Map<userId, {userName, amount}> }
+// activeBidWindows: itemId => { activeBidders: Map<userId, {userName, amount}>, graceTimer }
 const activeBidWindows = {};
 const bidRateLimits = {};
 
@@ -183,7 +203,7 @@ async function handlePlaceBid(ws, msg) {
     return ws.send(JSON.stringify({ type: "BID_REJECTED", reason: "Item not active" }));
   }
 
-  // Rate limiting
+  // Rate limiting: max 5 bids per 10 seconds per user
   const now = Date.now();
   if (!bidRateLimits[ws.userId] || now - bidRateLimits[ws.userId].firstHit > 10000) {
     bidRateLimits[ws.userId] = { count: 1, firstHit: now };
@@ -214,7 +234,7 @@ async function handlePlaceBid(ws, msg) {
     }));
   }
 
-  // Check points
+  // Check user has enough points
   const { rows: userRows } = await pool.query("SELECT points FROM users WHERE id=$1", [ws.userId]);
   if (parseFloat(amount) > parseFloat(userRows[0]?.points || 0)) {
     return ws.send(JSON.stringify({
@@ -229,13 +249,20 @@ async function handlePlaceBid(ws, msg) {
     await pool.query("UPDATE users SET points = points + $1 WHERE id=$2", [prev.amount, ws.userId]);
   }
 
-  // Deduct new bid
+  // Deduct new bid amount
   await pool.query("UPDATE users SET points = points - $1 WHERE id=$2", [amount, ws.userId]);
   const { rows: updated } = await pool.query("SELECT points FROM users WHERE id=$1", [ws.userId]);
   ws.send(JSON.stringify({ type: "POINTS_UPDATE", data: { points: updated[0].points } }));
 
-  // Register in active bidders
+  // Register in active bidders map
   if (!activeBidWindows[itemId]) activeBidWindows[itemId] = { activeBidders: new Map() };
+
+  // Cancel any pending grace timer if a new bidder is joining
+  if (activeBidWindows[itemId].graceTimer) {
+    clearTimeout(activeBidWindows[itemId].graceTimer);
+    activeBidWindows[itemId].graceTimer = null;
+  }
+
   activeBidWindows[itemId].activeBidders.set(String(ws.userId), {
     userName: ws.userName, amount: parseFloat(amount)
   });
@@ -252,6 +279,7 @@ async function handlePlaceBid(ws, msg) {
   await broadcastLeaderboard(roomId);
 }
 
+// FIX 2: WITHDRAW_BID — buyer can pull their bid; points refunded; last-bidder grace logic
 async function handleWithdrawBid(ws, msg) {
   const { itemId } = msg;
   const roomId = ws.roomId;
@@ -285,23 +313,35 @@ async function handleWithdrawBid(ws, msg) {
   const remaining = window.activeBidders.size;
 
   if (remaining === 1) {
+    // One bidder left — 5-second grace period, others can still jump in
     const [[winnerId, winnerInfo]] = [...window.activeBidders.entries()];
     broadcast(roomId, {
       type: "LAST_BIDDER_REMAINING",
-      data: { itemId, userId: winnerId, userName: winnerInfo.userName, amount: winnerInfo.amount, graceSecs: 5 }
+      data: {
+        itemId,
+        userId: winnerId,
+        userName: winnerInfo.userName,
+        amount: winnerInfo.amount,
+        graceSecs: 5
+      }
     });
-    // 5-second grace: others can jump in
-    setTimeout(async () => {
+
+    // Cancel any existing grace timer before setting a new one
+    if (window.graceTimer) clearTimeout(window.graceTimer);
+
+    window.graceTimer = setTimeout(async () => {
       const w = activeBidWindows[itemId];
-      if (!w || w.activeBidders.size !== 1) return;
+      if (!w || w.activeBidders.size !== 1) return; // someone else joined
       const { rows: check } = await pool.query("SELECT status FROM items WHERE id=$1", [itemId]);
       if (check[0]?.status !== "active") return;
       await finalizeItem(itemId, roomId, parseInt(winnerId), winnerInfo.userName, winnerInfo.amount);
     }, 5000);
 
   } else if (remaining === 0) {
+    // All bidders withdrew — fall back to highest DB bid
+    if (window.graceTimer) clearTimeout(window.graceTimer);
     delete activeBidWindows[itemId];
-    // Recalculate highest committed bid from DB
+
     const { rows: maxBid } = await pool.query(
       "SELECT user_id, amount FROM bids WHERE item_id=$1 ORDER BY amount DESC LIMIT 1", [itemId]
     );
@@ -309,7 +349,7 @@ async function handleWithdrawBid(ws, msg) {
       const { rows: wUser } = await pool.query("SELECT name FROM users WHERE id=$1", [maxBid[0].user_id]);
       await finalizeItem(itemId, roomId, maxBid[0].user_id, wUser[0]?.name, maxBid[0].amount);
     } else {
-      // Truly no bids
+      // Truly no bids — mark unsold
       await pool.query(
         "UPDATE items SET status='finished', winner_id=NULL, winning_bid=NULL, bidding_end=NOW() WHERE id=$1",
         [itemId]
@@ -319,6 +359,7 @@ async function handleWithdrawBid(ws, msg) {
       await broadcastLeaderboard(roomId);
     }
   }
+  // remaining > 1: auction continues normally, no action needed
 }
 
 function broadcastBidderList(roomId, itemId) {
@@ -328,13 +369,15 @@ function broadcastBidderList(roomId, itemId) {
       userId: uid, userName: info.userName, amount: info.amount
     }))
     : [];
-  // Sort by amount desc
   bidders.sort((a, b) => b.amount - a.amount);
   broadcast(roomId, { type: "BIDDER_LIST", data: { itemId, bidders } });
 }
 
 async function finalizeItem(itemId, roomId, winnerId, winnerName, winningBid) {
-  if (activeBidWindows[itemId]) delete activeBidWindows[itemId];
+  if (activeBidWindows[itemId]) {
+    if (activeBidWindows[itemId].graceTimer) clearTimeout(activeBidWindows[itemId].graceTimer);
+    delete activeBidWindows[itemId];
+  }
 
   await pool.query(
     "UPDATE items SET status='finished', winner_id=$1, winning_bid=$2, bidding_end=NOW() WHERE id=$3",
@@ -383,7 +426,7 @@ async function handleEndItem(ws, msg) {
   const window = activeBidWindows[itemId];
 
   if (window && window.activeBidders.size > 0) {
-    // Find highest bidder
+    // Find highest active bidder
     let topId = null, topName = null, topAmt = 0;
     for (const [uid, info] of window.activeBidders.entries()) {
       if (info.amount > topAmt) { topAmt = info.amount; topId = uid; topName = info.userName; }
@@ -401,14 +444,26 @@ async function handleEndItem(ws, msg) {
     }
     await finalizeItem(itemId, roomId, parseInt(topId), topName, topAmt);
   } else {
-    if (window) delete activeBidWindows[itemId];
-    await pool.query(
-      "UPDATE items SET status='finished', winner_id=NULL, winning_bid=NULL, bidding_end=NOW() WHERE id=$1",
+    // No active bidders — fall back to DB
+    if (window) {
+      if (window.graceTimer) clearTimeout(window.graceTimer);
+      delete activeBidWindows[itemId];
+    }
+    const { rows: maxBid } = await pool.query(
+      "SELECT b.user_id, b.amount, u.name FROM bids b JOIN users u ON u.id=b.user_id WHERE b.item_id=$1 ORDER BY b.amount DESC LIMIT 1",
       [itemId]
     );
-    const { rows: ended } = await pool.query("SELECT * FROM items WHERE id=$1", [itemId]);
-    broadcast(roomId, { type: "ITEM_ENDED", data: { ...ended[0], winner_name: null } });
-    await broadcastLeaderboard(roomId);
+    if (maxBid[0]) {
+      await finalizeItem(itemId, roomId, maxBid[0].user_id, maxBid[0].name, maxBid[0].amount);
+    } else {
+      await pool.query(
+        "UPDATE items SET status='finished', winner_id=NULL, winning_bid=NULL, bidding_end=NOW() WHERE id=$1",
+        [itemId]
+      );
+      const { rows: ended } = await pool.query("SELECT * FROM items WHERE id=$1", [itemId]);
+      broadcast(roomId, { type: "ITEM_ENDED", data: { ...ended[0], winner_name: null } });
+      await broadcastLeaderboard(roomId);
+    }
   }
 }
 
@@ -434,6 +489,7 @@ async function broadcastLeaderboard(roomId) {
   broadcast(roomId, { type: "LEADERBOARD", data: await getLeaderboard(roomId) });
 }
 
+// FIX 1: getLeaderboard now explicitly excludes admin role
 async function getLeaderboard(roomId) {
   const { rows: room } = await pool.query("SELECT status FROM rooms WHERE id=$1", [roomId]);
   const isFinished = room[0]?.status === "finished";
@@ -444,13 +500,13 @@ async function getLeaderboard(roomId) {
               ), 0)) as net_worth
        FROM room_participants rp
        JOIN users u ON u.id = rp.user_id
-       WHERE rp.room_id=$1 AND rp.is_spectator=FALSE AND u.role!='admin'
+       WHERE rp.room_id=$1 AND rp.is_spectator=FALSE AND u.role != 'admin'
        ORDER BY net_worth DESC LIMIT 10`
     : `SELECT u.id, u.name, rp.total_spent, rp.items_won,
               (10000 - rp.total_spent) as net_worth
        FROM room_participants rp
        JOIN users u ON u.id = rp.user_id
-       WHERE rp.room_id=$1 AND rp.is_spectator=FALSE AND u.role!='admin'
+       WHERE rp.room_id=$1 AND rp.is_spectator=FALSE AND u.role != 'admin'
        ORDER BY net_worth DESC LIMIT 10`;
   const { rows } = await pool.query(q, [roomId]);
   return rows;
@@ -458,7 +514,7 @@ async function getLeaderboard(roomId) {
 
 async function sendWinnerEmail(winnerId, itemId, amount) {
   try {
-    const transporter = createTransporter();
+    const transporter = getTransporter();
     if (!transporter) return;
     const from = process.env.EMAIL_FROM || process.env.SMTP_USER || process.env.EMAIL_USER;
     const { rows: user } = await pool.query("SELECT email, name FROM users WHERE id=$1", [winnerId]);
@@ -490,14 +546,14 @@ async function sendWinnerEmail(winnerId, itemId, amount) {
 
 async function sendLeaderboardEmail(roomId) {
   try {
-    const transporter = createTransporter();
+    const transporter = getTransporter();
     if (!transporter) { console.warn("⚠️  No SMTP config — skipping emails"); return; }
     const from = process.env.EMAIL_FROM || process.env.SMTP_USER || process.env.EMAIL_USER;
 
     const { rows: participants } = await pool.query(
       `SELECT u.id, u.email, u.name
        FROM room_participants rp JOIN users u ON u.id=rp.user_id
-       WHERE rp.room_id=$1 AND rp.is_spectator=FALSE AND u.role!='admin'`,
+       WHERE rp.room_id=$1 AND rp.is_spectator=FALSE AND u.role != 'admin'`,
       [roomId]
     );
     if (!participants.length) { console.log("No participants to email"); return; }

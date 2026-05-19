@@ -5,7 +5,9 @@ const getRooms = async (req, res, next) => {
   try {
     const { rows } = await pool.query(
       `SELECT r.*, u.name as creator_name,
-        (SELECT COUNT(*) FROM room_participants rp WHERE rp.room_id=r.id) as participant_count,
+        (SELECT COUNT(*) FROM room_participants rp
+         JOIN users u2 ON u2.id=rp.user_id
+         WHERE rp.room_id=r.id AND u2.role != 'admin') as participant_count,
         (SELECT COUNT(*) FROM items i WHERE i.room_id=r.id) as item_count
        FROM rooms r JOIN users u ON u.id=r.created_by
        ORDER BY r.created_at DESC`
@@ -81,6 +83,7 @@ const deleteItem = async (req, res, next) => {
 };
 
 // GET /api/v1/rooms/:id/leaderboard
+// FIX 1: explicitly exclude admin role from leaderboard
 const getLeaderboard = async (req, res, next) => {
   try {
     const { id: roomId } = req.params;
@@ -95,7 +98,7 @@ const getLeaderboard = async (req, res, next) => {
                    SELECT SUM(actual_price) FROM items WHERE room_id=$1 AND winner_id=u.id
                 ), 0)) as net_worth
          FROM room_participants rp JOIN users u ON u.id=rp.user_id
-         WHERE rp.room_id=$1 AND rp.is_spectator = FALSE
+         WHERE rp.room_id=$1 AND rp.is_spectator = FALSE AND u.role != 'admin'
          ORDER BY net_worth DESC LIMIT 10`,
         [roomId]
       );
@@ -105,7 +108,7 @@ const getLeaderboard = async (req, res, next) => {
         `SELECT u.id, u.name, rp.total_spent, rp.items_won,
                 (10000 - rp.total_spent) as net_worth
          FROM room_participants rp JOIN users u ON u.id=rp.user_id
-         WHERE rp.room_id=$1 AND rp.is_spectator = FALSE
+         WHERE rp.room_id=$1 AND rp.is_spectator = FALSE AND u.role != 'admin'
          ORDER BY net_worth DESC LIMIT 10`,
         [roomId]
       );

@@ -18,6 +18,7 @@ const state = {
   currentRoom: null,
   currentItems: [],
   topBids: {},       // itemId => { userId, userName, amount }
+  activeBidders: {}, // FIX 2: itemId => [{userId, userName, amount}]
   leaderboard: [],
   ws: null,
   activeItemId: null,
@@ -25,28 +26,28 @@ const state = {
   bidWindowUserId: null,
   countdownInterval: null,
   resultsRevealed: false,
-  allBids: {}, // itemId => array of bid objects
+  allBids: {},
 };
 
+// ─── AUDIO ────────────────────────────────────
 const audioCtx = new (window.AudioContext || window.webkitAudioContext)();
 function playSound(type) {
-  if (audioCtx.state === 'suspended') audioCtx.resume();
+  if (audioCtx.state === "suspended") audioCtx.resume();
   const osc = audioCtx.createOscillator();
   const gain = audioCtx.createGain();
   osc.connect(gain);
   gain.connect(audioCtx.destination);
   const now = audioCtx.currentTime;
-
-  if (type === 'tick') {
-    osc.type = 'sine'; osc.frequency.setValueAtTime(800, now); osc.frequency.exponentialRampToValueAtTime(10, now + 0.1);
+  if (type === "tick") {
+    osc.type = "sine"; osc.frequency.setValueAtTime(800, now); osc.frequency.exponentialRampToValueAtTime(10, now + 0.1);
     gain.gain.setValueAtTime(0.3, now); gain.gain.exponentialRampToValueAtTime(0.01, now + 0.1);
     osc.start(now); osc.stop(now + 0.1);
-  } else if (type === 'success') {
-    osc.type = 'triangle'; osc.frequency.setValueAtTime(400, now); osc.frequency.linearRampToValueAtTime(800, now + 0.2);
+  } else if (type === "success") {
+    osc.type = "triangle"; osc.frequency.setValueAtTime(400, now); osc.frequency.linearRampToValueAtTime(800, now + 0.2);
     gain.gain.setValueAtTime(0.5, now); gain.gain.linearRampToValueAtTime(0, now + 0.5);
     osc.start(now); osc.stop(now + 0.5);
-  } else if (type === 'error') {
-    osc.type = 'sawtooth'; osc.frequency.setValueAtTime(150, now);
+  } else if (type === "error") {
+    osc.type = "sawtooth"; osc.frequency.setValueAtTime(150, now);
     gain.gain.setValueAtTime(0.5, now); gain.gain.linearRampToValueAtTime(0, now + 0.3);
     osc.start(now); osc.stop(now + 0.3);
   }
@@ -54,34 +55,34 @@ function playSound(type) {
 
 function escapeHTML(str) {
   if (!str) return "";
-  return str.replace(/[&<>'"]/g, tag => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', "'": '&#39;', '"': '&quot;' }[tag]));
+  return str.replace(/[&<>'"]/g, tag => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", "'": "&#39;", '"': "&quot;" }[tag]));
 }
 
 function updatePointsBar() {
-  const wrap = $('points-bar-wrap');
-  const fill = $('points-bar-fill');
+  const wrap = $("points-bar-wrap");
+  const fill = $("points-bar-fill");
   if (!wrap || !fill) return;
-  if (!state.user || state.user.role === 'admin' || state.user.isSpectator) {
-    wrap.style.display = 'none'; return;
+  if (!state.user || state.user.role === "admin" || state.user.isSpectator) {
+    wrap.style.display = "none"; return;
   }
-  wrap.style.display = 'block';
+  wrap.style.display = "block";
   const pts = parseFloat(state.user.points || 0);
   const pct = Math.min(100, Math.max(0, (pts / 10000) * 100));
   fill.style.width = `${pct}%`;
-  fill.style.background = pts < 2000 ? 'var(--red)' : 'var(--green)';
+  fill.style.background = pts < 2000 ? "var(--red)" : "var(--green)";
 }
 
 function showWinnerBanner(userName, itemName, amount) {
-  const banner = $('winner-banner');
+  const banner = $("winner-banner");
   if (!banner) return;
   banner.textContent = `🏆 ${userName} won ${itemName} for ${formatCurrency(amount)}!`;
-  banner.classList.add('show');
-  setTimeout(() => banner.classList.remove('show'), 4000);
+  banner.classList.add("show");
+  setTimeout(() => banner.classList.remove("show"), 4000);
 }
 
 function toggleMobileSidebar() {
-  const sb = $('arena-sidebar');
-  if (sb) sb.classList.toggle('open');
+  const sb = $("arena-sidebar");
+  if (sb) sb.classList.toggle("open");
 }
 
 // ─── UTILS ────────────────────────────────────
@@ -120,7 +121,7 @@ function addFeed(msg, type = "system") {
   while (feed.children.length > 50) feed.lastChild.remove();
 }
 
-// ─── AUTH ──────────────────────────────────────
+// ─── API ───────────────────────────────────────
 async function apiCall(method, path, body) {
   const headers = { "Content-Type": "application/json" };
   if (state.token) headers["Authorization"] = `Bearer ${state.token}`;
@@ -153,16 +154,13 @@ function logout() {
 
 function renderNavUser() {
   const wrap = $("nav-user-wrap");
-  if (!state.user) {
-    wrap.innerHTML = "";
-    return;
-  }
+  if (!state.user) { wrap.innerHTML = ""; return; }
   const pointsHTML = state.user.role !== "admin"
-    ? `<span style="font-family:var(--mono);font-size:12px;color:var(--gold);border:1px solid var(--border-bright);padding:3px 10px;border-radius:2px;" id="nav-points">⚡ ${parseFloat(state.user.points || 0).toFixed(0)} pts</span>`
+    ? `<span style="font-family:var(--mono);font-size:13px;color:var(--gold);border:1px solid var(--border-bright);padding:3px 10px;border-radius:2px;" id="nav-points">⚡ ${parseFloat(state.user.points || 0).toFixed(0)} pts</span>`
     : "";
   wrap.innerHTML = `
     ${pointsHTML}
-    <span class="nav-user">${state.user.name}</span>
+    <span class="nav-user">${escapeHTML(state.user.name)}</span>
     <span class="nav-badge ${state.user.role === "admin" ? "admin" : ""}">${state.user.role.toUpperCase()}</span>
     <button class="btn btn-ghost" onclick="logout()" style="padding:6px 12px">LOGOUT</button>
   `;
@@ -196,7 +194,6 @@ async function handleAuthSubmit(e) {
   const btn = $("auth-submit");
   btn.disabled = true;
   $("auth-error").style.display = "none";
-
   try {
     let data;
     if (authMode === "register") {
@@ -220,11 +217,7 @@ async function handleAuthSubmit(e) {
 // ─── LOBBY ─────────────────────────────────────
 async function showLobby() {
   showPage("page-lobby");
-  if (state.user?.role === "admin") {
-    $("create-room-btn").style.display = "inline-flex";
-  } else {
-    $("create-room-btn").style.display = "none";
-  }
+  $("create-room-btn").style.display = state.user?.role === "admin" ? "inline-flex" : "none";
   await loadRooms();
 }
 
@@ -240,14 +233,14 @@ async function loadRooms() {
 function renderRooms(rooms) {
   const grid = $("rooms-grid");
   if (!rooms.length) {
-    grid.innerHTML = `<div style="color:var(--text-dim);font-family:var(--mono);font-size:13px;padding:40px 0;">No rooms yet. ${state.user?.role === "admin" ? "Create one above." : "Ask an admin to create one."}</div>`;
+    grid.innerHTML = `<div style="color:var(--text-dim);font-family:var(--mono);font-size:14px;padding:40px 0;">No rooms yet. ${state.user?.role === "admin" ? "Create one above." : "Ask an admin to create one."}</div>`;
     return;
   }
   grid.innerHTML = rooms.map(r => `
     <div class="room-card" onclick="joinRoom(${r.id})">
       ${state.user?.role === "admin" ? `
-        <div style="position:absolute; top:12px; right:12px; font-size:16px; cursor:pointer; z-index:1;"
-             onclick="event.stopPropagation(); deleteRoomReq(${r.id}, '${escapeHTML(r.name)}', '${r.status}')">🗑️</div>
+        <div style="position:absolute;top:12px;right:12px;font-size:16px;cursor:pointer;z-index:1;"
+             onclick="event.stopPropagation();deleteRoomReq(${r.id},'${escapeHTML(r.name)}','${r.status}')">🗑️</div>
       ` : ""}
       <div class="room-name">${escapeHTML(r.name)}</div>
       <div class="room-meta">
@@ -261,30 +254,20 @@ function renderRooms(rooms) {
 }
 
 async function deleteRoomReq(id, name, status) {
-  const statusLabel = status === "finished" ? "finished" : status === "active" ? "currently active" : "waiting";
   const confirmMsg = status === "active"
-    ? `⚠️ "${name}" is currently active! Deleting will end the auction for all participants. Are you sure?`
+    ? `⚠️ "${name}" is currently active! Deleting will end the auction. Are you sure?`
     : `Delete room "${name}"? This cannot be undone.`;
-
   if (!confirm(confirmMsg)) return;
   try {
     await apiCall("DELETE", `/rooms/${id}`);
     toast("Room deleted", "success");
     loadRooms();
-  } catch (err) {
-    toast(err.message, "error");
-  }
+  } catch (err) { toast(err.message, "error"); }
 }
 
 // ─── CREATE ROOM MODAL ─────────────────────────
-function openCreateRoomModal() {
-  $("create-room-modal").classList.add("open");
-  $("room-name-input").focus();
-}
-function closeCreateRoomModal() {
-  $("create-room-modal").classList.remove("open");
-  $("room-name-input").value = "";
-}
+function openCreateRoomModal() { $("create-room-modal").classList.add("open"); $("room-name-input").focus(); }
+function closeCreateRoomModal() { $("create-room-modal").classList.remove("open"); $("room-name-input").value = ""; }
 
 async function submitCreateRoom() {
   const name = $("room-name-input").value.trim();
@@ -294,9 +277,7 @@ async function submitCreateRoom() {
     closeCreateRoomModal();
     toast("Room created!", "success");
     await loadRooms();
-  } catch (err) {
-    toast(err.message, "error");
-  }
+  } catch (err) { toast(err.message, "error"); }
 }
 
 // ─── JOIN ROOM ─────────────────────────────────
@@ -306,6 +287,7 @@ async function joinRoom(roomId) {
     state.currentRoom = data.room;
     state.currentItems = data.items;
     state.topBids = {};
+    state.activeBidders = {};
     data.topBids.forEach(b => {
       state.topBids[b.item_id] = { userId: b.user_id, userName: b.user_name, amount: b.amount };
     });
@@ -317,7 +299,6 @@ async function joinRoom(roomId) {
       });
     }
     state.resultsRevealed = data.room.status === "finished";
-
     renderArena();
     showPage("page-arena");
     connectWebSocket(roomId);
@@ -333,7 +314,6 @@ function renderArena() {
   $("arena-room-status").textContent = room.status.toUpperCase();
   $("arena-room-status").className = `room-status status-${room.status}`;
 
-  // Show admin dashboard button only for admin
   const dashBtn = $("admin-dashboard-btn");
   if (dashBtn) dashBtn.style.display = state.user?.role === "admin" ? "inline-flex" : "none";
 
@@ -350,10 +330,11 @@ function renderArena() {
   if (state.resultsRevealed) renderResults();
 }
 
+// FIX 2: renderItems includes live bidder list and WITHDRAW button
 function renderItems() {
   const container = $("items-container");
   if (!state.currentItems.length) {
-    container.innerHTML = `<div style="color:var(--text-dim);font-family:var(--mono);font-size:13px;padding:40px 0;text-align:center;">No items yet. Admin will add items to bid on.</div>`;
+    container.innerHTML = `<div style="color:var(--text-dim);font-family:var(--mono);font-size:14px;padding:40px 0;text-align:center;">No items yet. Admin will add items to bid on.</div>`;
     return;
   }
 
@@ -364,6 +345,9 @@ function renderItems() {
     const isAdmin = state.user?.role === "admin";
     const isHighestBidder = topBid && String(topBid.userId) === String(state.user?.id);
 
+    // FIX 2: am I currently holding a live bid on this item?
+    const myActiveBid = (state.activeBidders[item.id] || []).find(b => String(b.userId) === String(state.user?.id));
+
     const revealed = item.revealed && item.actual_price != null;
     const myBid = topBid && String(topBid.userId) === String(state.user?.id) ? topBid.amount : null;
     let pnlHTML = "";
@@ -373,11 +357,11 @@ function renderItems() {
         const diff = actual - parseFloat(myBid);
         const cls = diff >= 0 ? "profit" : "loss";
         const sign = diff >= 0 ? "+" : "";
-        pnlHTML = `<div class="${cls}" style="font-family:var(--mono);font-size:12px;margin-top:4px;">
+        pnlHTML = `<div class="${cls}" style="font-family:var(--mono);font-size:13px;margin-top:4px;">
           Your bid: ${formatCurrency(myBid)} → Actual: ${formatCurrency(actual)} → P&L: <span class="${cls}">${sign}${formatCurrency(diff)}</span>
         </div>`;
       } else {
-        pnlHTML = `<div style="font-family:var(--mono);font-size:12px;color:var(--text-mute);margin-top:4px;">Actual price: ${formatCurrency(actual)}</div>`;
+        pnlHTML = `<div style="font-family:var(--mono);font-size:13px;color:var(--text-mute);margin-top:4px;">Actual price: ${formatCurrency(actual)}</div>`;
       }
     }
 
@@ -389,12 +373,29 @@ function renderItems() {
         (String(item.winner_id) === String(state.user?.id) ? state.user.name : "Unknown");
       const isMyWin = String(item.winner_id) === String(state.user?.id);
       winnerHTML = `
-        <div style="margin-top:12px;padding:10px 14px;background:rgba(245,197,24,0.06);border:1px solid rgba(245,197,24,0.25);border-radius:2px;font-family:var(--mono);font-size:12px;">
+        <div style="margin-top:12px;padding:10px 14px;background:rgba(245,197,24,0.06);border:1px solid rgba(245,197,24,0.25);border-radius:2px;font-family:var(--mono);font-size:13px;">
           🏆 Won by <strong style="color:var(--gold);">${escapeHTML(winnerName)}</strong>${isMyWin ? ' <span style="color:var(--green);">(You!)</span>' : ''} for ${formatCurrency(item.winning_bid)}
         </div>`;
     } else if (isFinished && !item.winner_id) {
-      winnerHTML = `<div style="margin-top:12px;padding:10px 14px;background:var(--bg3);border:1px solid var(--bg4);border-radius:2px;font-family:var(--mono);font-size:12px;color:var(--text-mute);">No bids placed — item unsold</div>`;
+      winnerHTML = `<div style="margin-top:12px;padding:10px 14px;background:var(--bg3);border:1px solid var(--bg4);border-radius:2px;font-family:var(--mono);font-size:13px;color:var(--text-mute);">No bids placed — item unsold</div>`;
     }
+
+    // FIX 2: live bidder list for active items
+    const bidders = state.activeBidders[item.id] || [];
+    const liveBiddersHTML = isActive && bidders.length > 0 ? `
+      <div class="live-bidders">
+        <div class="live-bidders-title">LIVE BIDDERS (${bidders.length})</div>
+        ${bidders.map((b, i) => {
+      const isMe = String(b.userId) === String(state.user?.id);
+      return `<div class="live-bidder-row">
+            <span class="live-bidder-name">
+              ${i === 0 ? "👑 " : ""}${escapeHTML(b.userName)}${isMe ? '<span class="live-bidder-you">(you)</span>' : ""}
+            </span>
+            <span class="live-bidder-amount">${formatCurrency(b.amount)}</span>
+          </div>`;
+    }).join("")}
+      </div>
+    ` : "";
 
     return `
     <div class="item-card ${isActive ? "active-item" : ""} ${isFinished ? "finished-item" : ""}" id="item-card-${item.id}">
@@ -408,7 +409,7 @@ function renderItems() {
           <div class="bid-amount ${topBid ? "" : "dim"}" id="bid-amount-${item.id}">
             ${topBid ? formatCurrency(topBid.amount) : "—"}
           </div>
-          <div class="bid-user" id="bid-user-${item.id}">${topBid ? "by " + topBid.userName : "No bids yet"}</div>
+          <div class="bid-user" id="bid-user-${item.id}">${topBid ? "by " + escapeHTML(topBid.userName) : "No bids yet"}</div>
         </div>
         <div class="bid-block">
           <div class="bid-label">Status</div>
@@ -424,6 +425,7 @@ function renderItems() {
         <div class="countdown-text" id="countdown-text-${item.id}">10s window — bid to outbid</div>
       </div>
 
+      ${liveBiddersHTML}
       ${winnerHTML}
       ${pnlHTML}
 
@@ -434,7 +436,7 @@ function renderItems() {
             <div class="spectating-badge">👀 SPECTATING</div>
           </div>
         ` : `
-          <div class="bid-row" id="bid-row-${item.id}">
+          <div class="bid-row" id="bid-row-${item.id}" style="margin-top:14px;">
             <div class="bid-input-wrap">
               <span class="bid-currency">₹</span>
               <input class="form-input" type="number" id="bid-val-${item.id}"
@@ -444,8 +446,15 @@ function renderItems() {
             <button class="btn btn-gold" id="bid-btn-${item.id}"
               onclick="placeBid(${item.id})"
               ${isHighestBidder ? "disabled" : ""}>
-              ${isHighestBidder ? "LEADING BID" : "PLACE BID"}
+              ${isHighestBidder ? "LEADING" : "PLACE BID"}
             </button>
+            ${myActiveBid ? `
+              <button class="btn btn-withdraw" id="withdraw-btn-${item.id}"
+                onclick="withdrawBid(${item.id})"
+                title="Withdraw your bid of ${formatCurrency(myActiveBid.amount)} and get points back">
+                ✕ WITHDRAW ${formatCurrency(myActiveBid.amount)}
+              </button>
+            ` : ""}
           </div>
           <div style="font-family:var(--mono);font-size:11px;color:var(--text-mute);margin-top:6px;">
             Available: <span style="color:var(--gold);">⚡ ${parseFloat(state.user?.points || 0).toFixed(0)} pts</span>
@@ -463,7 +472,7 @@ function renderItems() {
           <div class="bid-history-list" id="bid-hist-${item.id}">
             ${state.allBids[item.id].map(b => `
               <div class="bid-history-item">
-                <span>${b.user_name}</span>
+                <span>${escapeHTML(b.user_name)}</span>
                 <span>${formatCurrency(b.amount)}</span>
               </div>
             `).join("")}
@@ -506,9 +515,7 @@ function connectWebSocket(roomId) {
     }, 3000);
   };
 
-  ws.onerror = () => {
-    $("ws-dot").className = "ws-indicator error";
-  };
+  ws.onerror = () => { $("ws-dot").className = "ws-indicator error"; };
 
   ws.onmessage = (e) => {
     let msg;
@@ -518,9 +525,7 @@ function connectWebSocket(roomId) {
 }
 
 function wsSend(obj) {
-  if (state.ws?.readyState === WebSocket.OPEN) {
-    state.ws.send(JSON.stringify(obj));
-  }
+  if (state.ws?.readyState === WebSocket.OPEN) state.ws.send(JSON.stringify(obj));
 }
 
 // ─── WS MESSAGE HANDLER ────────────────────────
@@ -528,72 +533,101 @@ function handleWsMessage(msg) {
   switch (msg.type) {
 
     case "ROOM_SNAPSHOT": {
-      const isDifferent = JSON.stringify(state.currentItems) !== JSON.stringify(msg.data.items)
-        || state.currentRoom?.status !== msg.data.room?.status;
-
       state.currentRoom = msg.data.room;
       state.currentItems = msg.data.items;
       if (msg.data.isSpectator !== undefined) {
         state.user.isSpectator = msg.data.isSpectator;
         updatePointsBar();
       }
-
       msg.data.topBids.forEach(b => {
         state.topBids[b.item_id] = { userId: b.user_id, userName: b.user_name || "?", amount: b.amount };
       });
-
-      if (isDifferent) renderItems();
+      // Restore live bidder lists from snapshot
+      if (msg.data.activeBidderMap) {
+        state.activeBidders = {};
+        for (const [itemId, bidders] of Object.entries(msg.data.activeBidderMap)) {
+          state.activeBidders[itemId] = bidders;
+        }
+      }
+      renderItems();
       break;
     }
 
     case "REAUTH_REQUIRED":
-      toast(msg.reason + " - Please login again.", "error");
+      toast(msg.reason + " — Please login again.", "error");
       setTimeout(logout, 3000);
       break;
 
+    case "BID_PLACED": {
+      const { itemId, userId, userName, amount } = msg.data;
+      updateBidDisplay(itemId, { userId, userName, amount });
+      addFeed(`<b>${escapeHTML(userName)}</b> bid ${formatCurrency(amount)}`, "bid");
+      playSound("tick");
+      break;
+    }
+
+    // FIX 2: BIDDER_LIST replaces the live bidder map and re-renders controls
+    case "BIDDER_LIST": {
+      const { itemId, bidders } = msg.data;
+      state.activeBidders[itemId] = bidders;
+      // Update top bid to highest active bidder
+      if (bidders.length > 0) {
+        const top = bidders[0]; // already sorted desc by server
+        state.topBids[itemId] = { userId: top.userId, userName: top.userName, amount: top.amount };
+        updateBidDisplay(itemId, state.topBids[itemId]);
+      }
+      // Re-render just this item's bidder list and buttons
+      renderItems();
+      break;
+    }
+
+    // FIX 2: BID_WITHDRAWN — update UI
+    case "BID_WITHDRAWN": {
+      const { itemId, userId, userName } = msg.data;
+      // activeBidders updated via BIDDER_LIST which follows
+      addFeed(`<b>${escapeHTML(userName)}</b> withdrew their bid`, "system");
+      if (String(userId) === String(state.user?.id)) {
+        toast("Your bid was withdrawn and points refunded", "success");
+      }
+      break;
+    }
+
+    // FIX 2: LAST_BIDDER_REMAINING — show countdown to auto-close
+    case "LAST_BIDDER_REMAINING": {
+      const { itemId, userName, amount, graceSecs } = msg.data;
+      addFeed(`⏳ Last bidder: <b>${escapeHTML(userName)}</b> @ ${formatCurrency(amount)} — auto-closes in ${graceSecs}s`, "bid");
+      startCountdown(itemId, graceSecs);
+      break;
+    }
+
     case "BID_WINDOW_OPEN": {
-      // Someone has placed a bid — 10s window opened. Show countdown.
-      // This does NOT mean they won; admin must end the item for that.
       const { itemId, userId, userName, amount, expiresIn, bidding_window_started_at } = msg.data;
       state.bidWindowActive = true;
       state.bidWindowUserId = userId;
       state.activeItemId = itemId;
-
       updateBidDisplay(itemId, { userId, userName, amount });
-
       let remaining = expiresIn;
       if (bidding_window_started_at) {
         const elapsed = (Date.now() - bidding_window_started_at) / 1000;
         remaining = Math.max(1, expiresIn - elapsed);
       }
-
       startCountdown(itemId, remaining);
       refreshBidButton(itemId, userId);
-
       addFeed(`<b>${escapeHTML(userName)}</b> placed bid of ${formatCurrency(amount)}`, "bid");
       playSound("tick");
       break;
     }
 
     case "BID_COMMITTED": {
-      // The 10s window expired — this bid is now the confirmed leading bid.
-      // The item is still active; admin will end it to declare the final winner.
       const { itemId, userId, userName, amount } = msg.data;
       state.topBids[itemId] = { userId, userName, amount };
-
       if (!state.allBids[itemId]) state.allBids[itemId] = [];
       state.allBids[itemId].unshift({ item_id: itemId, user_id: userId, amount, user_name: userName });
-
       state.bidWindowActive = false;
       stopCountdown(itemId);
       updateBidDisplay(itemId, { userId, userName, amount });
-
-      // Re-enable bidding for everyone except the current leader
       refreshBidButton(itemId, userId);
-
       addFeed(`✓ Leading bid confirmed: <b>${escapeHTML(userName)}</b> @ ${formatCurrency(amount)}`, "system");
-
-      // Only notify the current leader (not a "won" announcement)
       if (String(userId) === String(state.user?.id)) {
         toast(`Your bid of ${formatCurrency(amount)} is now the leading bid`, "success");
       }
@@ -631,6 +665,7 @@ function handleWsMessage(msg) {
     case "ITEM_STARTED": {
       const item = msg.data;
       updateItemInState(item);
+      state.activeBidders[item.id] = [];
       renderItems();
       addFeed(`📦 Bidding started: <b>${escapeHTML(item.name)}</b>`, "system");
       toast(`Bidding open: ${item.name}`, "gold");
@@ -638,28 +673,21 @@ function handleWsMessage(msg) {
     }
 
     case "ITEM_ENDED": {
-      // Admin has ended this item — THIS is when the winner is declared
       const item = msg.data;
-
-      // Stop any active countdown for this item
       stopCountdown(item.id);
       state.bidWindowActive = false;
-
-      // Persist winner name onto item state for rendering
+      delete state.activeBidders[item.id];
       updateItemInState(item);
       renderItems();
 
       const winnerName = item.winner_name;
       if (winnerName) {
         const isMyWin = String(item.winner_id) === String(state.user?.id);
-        addFeed(`🏆 <b>${escapeHTML(item.name)}</b> sold to <b>${escapeHTML(winnerName)}</b> for ${formatCurrency(item.winning_bid)}`, "win");
+        addFeed(`🏆 <b>${escapeHTML(item.name)}</b> → <b>${escapeHTML(winnerName)}</b> for ${formatCurrency(item.winning_bid)}`, "win");
         showWinnerBanner(winnerName, item.name, item.winning_bid);
         playSound("success");
-        if (isMyWin) {
-          toast(`🏆 Congratulations! You won ${item.name}!`, "success");
-        } else {
-          toast(`${winnerName} won ${item.name} for ${formatCurrency(item.winning_bid)}`, "gold");
-        }
+        if (isMyWin) toast(`🏆 Congratulations! You won ${item.name}!`, "success");
+        else toast(`${winnerName} won ${item.name} for ${formatCurrency(item.winning_bid)}`, "gold");
       } else {
         addFeed(`🔔 <b>${escapeHTML(item.name)}</b> — no bids, item unsold`, "system");
         toast(`Bidding ended for ${item.name} — no winner`, "info");
@@ -690,6 +718,10 @@ function handleWsMessage(msg) {
     case "USER_JOINED":
       addFeed(`👤 ${escapeHTML(msg.data.name)} joined the room`, "system");
       break;
+
+    case "ERROR":
+      toast(msg.reason || "An error occurred", "error");
+      break;
   }
 }
 
@@ -702,7 +734,12 @@ function updateBidDisplay(itemId, { userId, userName, amount }) {
   const amtEl = $(`bid-amount-${itemId}`);
   const userEl = $(`bid-user-${itemId}`);
   if (amtEl) { amtEl.textContent = formatCurrency(amount); amtEl.classList.remove("dim"); }
-  if (userEl) userEl.textContent = `by ${userName}`;
+  if (userEl) userEl.textContent = `by ${escapeHTML(userName)}`;
+  if (state.topBids[itemId]) {
+    state.topBids[itemId] = { ...state.topBids[itemId], userId, userName, amount };
+  } else {
+    state.topBids[itemId] = { userId, userName, amount };
+  }
 }
 
 function refreshBidButton(itemId, highBidderUserId) {
@@ -710,7 +747,7 @@ function refreshBidButton(itemId, highBidderUserId) {
   if (!btn) return;
   const isMe = String(highBidderUserId) === String(state.user?.id);
   btn.disabled = isMe;
-  btn.textContent = isMe ? "LEADING BID" : "PLACE BID";
+  btn.textContent = isMe ? "LEADING" : "PLACE BID";
 }
 
 // ─── COUNTDOWN ─────────────────────────────────
@@ -719,25 +756,18 @@ function startCountdown(itemId, seconds) {
   const fill = $(`countdown-fill-${itemId}`);
   const text = $(`countdown-text-${itemId}`);
   if (!wrap) return;
-
   stopCountdown(itemId);
   wrap.classList.add("visible");
-
   let remaining = Math.ceil(seconds);
   fill.style.width = "100%";
   text.textContent = `${remaining}s — bid now to outbid`;
-
   const interval = setInterval(() => {
     remaining--;
-    if (remaining <= 0) {
-      stopCountdown(itemId);
-      return;
-    }
+    if (remaining <= 0) { stopCountdown(itemId); return; }
     playSound("tick");
     fill.style.width = `${(remaining / seconds) * 100}%`;
     text.textContent = `${remaining}s — bid now to outbid`;
   }, 1000);
-
   state.countdownInterval = { id: itemId, interval };
 }
 
@@ -755,14 +785,20 @@ function placeBid(itemId) {
   const input = $(`bid-val-${itemId}`);
   const amount = parseFloat(input?.value);
   if (!amount || amount <= 0) return toast("Enter a valid bid amount", "error");
-
   const topBid = state.topBids[itemId];
   if (topBid && amount <= parseFloat(topBid.amount)) {
     return toast(`Bid must exceed ${formatCurrency(topBid.amount)}`, "error");
   }
-
   wsSend({ type: "PLACE_BID", itemId, amount });
   if (input) input.value = "";
+}
+
+// FIX 2: withdraw bid
+function withdrawBid(itemId) {
+  const myBid = (state.activeBidders[itemId] || []).find(b => String(b.userId) === String(state.user?.id));
+  if (!myBid) return toast("No active bid to withdraw", "error");
+  if (!confirm(`Withdraw your bid of ${formatCurrency(myBid.amount)}? Points will be refunded.`)) return;
+  wsSend({ type: "WITHDRAW_BID", itemId });
 }
 
 // ─── ADMIN ACTIONS ─────────────────────────────
@@ -775,26 +811,22 @@ function adminEndItem(itemId) {
   const topBid = state.topBids[itemId];
   const confirmMsg = topBid
     ? `End bidding for "${item?.name}"?\n\nCurrent leader: ${topBid.userName} @ ${formatCurrency(topBid.amount)}\n\nThey will be declared the winner.`
-    : `End bidding for "${item?.name}"? No bids have been placed — item will be unsold.`;
-
+    : `End bidding for "${item?.name}"? No bids placed — item will be unsold.`;
   if (!confirm(confirmMsg)) return;
   wsSend({ type: "ADMIN_END_ITEM", itemId });
 }
 
 function adminRevealPrices() {
-  if (!confirm("Reveal actual prices to all players? This ends the game and sends result emails to all participants.")) return;
+  if (!confirm("Reveal actual prices to all players? This ends the game and sends result emails.")) return;
   wsSend({ type: "ADMIN_REVEAL_PRICES", roomId: state.currentRoom.id });
 }
 
 async function openAdminDashboard() {
   $("admin-dashboard-modal").classList.add("open");
-
   const { leaderboard } = state;
   $("dash-total-players").textContent = leaderboard.length;
-
   const activeItem = state.currentItems.find(i => i.status === "active");
   $("dash-active-item").textContent = activeItem ? activeItem.name : "None";
-
   const list = $("dash-players-list");
   const maxPts = Math.max(...leaderboard.map(p => parseFloat(p.net_worth)), 1);
   list.innerHTML = leaderboard.map(p => {
@@ -802,20 +834,18 @@ async function openAdminDashboard() {
     const pct = Math.max(0, (pts / maxPts) * 100);
     return `
     <div style="margin-bottom:8px;">
-      <div style="display:flex; justify-content:space-between; margin-bottom:4px;">
-        <span style="font-family:var(--mono);font-size:12px;">${escapeHTML(p.name)}</span>
-        <span style="color:var(--gold);font-family:var(--mono);font-size:12px;">⚡ ${pts.toFixed(0)} pts</span>
+      <div style="display:flex;justify-content:space-between;margin-bottom:4px;">
+        <span style="font-family:var(--mono);font-size:13px;">${escapeHTML(p.name)}</span>
+        <span style="color:var(--gold);font-family:var(--mono);font-size:13px;">⚡ ${pts.toFixed(0)} pts</span>
       </div>
-      <div style="height:4px; background:var(--bg4); border-radius:2px; overflow:hidden;">
-        <div style="height:100%; width:${pct}%; background:var(--gold);"></div>
+      <div style="height:4px;background:var(--bg4);border-radius:2px;overflow:hidden;">
+        <div style="height:100%;width:${pct}%;background:var(--gold);"></div>
       </div>
-    </div>
-  `}).join("");
+    </div>`;
+  }).join("");
 }
 
-function closeAdminDashboard() {
-  $("admin-dashboard-modal").classList.remove("open");
-}
+function closeAdminDashboard() { $("admin-dashboard-modal").classList.remove("open"); }
 
 async function adminResetPoints() {
   if (!confirm("Reset ALL buyers to 10,000 points?")) return;
@@ -823,16 +853,11 @@ async function adminResetPoints() {
     await apiCall("POST", "/rooms/reset-points");
     toast("All buyers reset to 10,000 points", "success");
     closeAdminDashboard();
-  } catch (err) {
-    toast(err.message, "error");
-  }
+  } catch (err) { toast(err.message, "error"); }
 }
 
 // ─── ADD ITEM MODAL ────────────────────────────
-function openAddItemModal() {
-  $("add-item-modal").classList.add("open");
-  $("item-name-input").focus();
-}
+function openAddItemModal() { $("add-item-modal").classList.add("open"); $("item-name-input").focus(); }
 function closeAddItemModal() {
   $("add-item-modal").classList.remove("open");
   ["item-name-input", "item-desc-input", "item-price-input", "item-order-input"].forEach(id => $(id).value = "");
@@ -843,10 +868,8 @@ async function submitAddItem() {
   const description = $("item-desc-input").value.trim();
   const actual_price = parseFloat($("item-price-input").value);
   const display_order = parseInt($("item-order-input").value) || (state.currentItems.length + 1);
-
   if (!name) return toast("Item name required", "error");
   if (!actual_price) return toast("Actual price required", "error");
-
   try {
     await apiCall("POST", `/rooms/${state.currentRoom.id}/items`, { name, description, actual_price, display_order });
     closeAddItemModal();
@@ -854,9 +877,7 @@ async function submitAddItem() {
     const data = await apiCall("GET", `/rooms/${state.currentRoom.id}`);
     state.currentItems = data.items;
     renderItems();
-  } catch (err) {
-    toast(err.message, "error");
-  }
+  } catch (err) { toast(err.message, "error"); }
 }
 
 // ─── DELETE ITEM ───────────────────────────────
@@ -868,9 +889,7 @@ async function openDeleteItem(itemId) {
     const data = await apiCall("GET", `/rooms/${state.currentRoom.id}`);
     state.currentItems = data.items;
     renderItems();
-  } catch (err) {
-    toast(err.message, "error");
-  }
+  } catch (err) { toast(err.message, "error"); }
 }
 
 // ─── LEADERBOARD ───────────────────────────────
@@ -879,7 +898,7 @@ function renderLeaderboard() {
   if (!list) return;
   const top5 = state.leaderboard.slice(0, 5);
   if (!top5.length) {
-    list.innerHTML = `<div style="color:var(--text-mute);font-family:var(--mono);font-size:11px;">No bids yet</div>`;
+    list.innerHTML = `<div style="color:var(--text-mute);font-family:var(--mono);font-size:12px;">No bids yet</div>`;
     return;
   }
   list.innerHTML = top5.map((p, i) => {
@@ -902,28 +921,24 @@ function renderLeaderboard() {
 function renderResults() {
   const wrap = $("results-section");
   if (!wrap) return;
-
   const finishedItems = state.currentItems.filter(i => i.status === "finished" && i.revealed);
   if (!finishedItems.length) { wrap.style.display = "none"; return; }
-
   wrap.style.display = "block";
 
   const itemsHTML = finishedItems.map(item => {
     const actual = parseFloat(item.actual_price || 0);
     const winning = parseFloat(item.winning_bid || 0);
-    const winnerId = item.winner_id;
-    const isMyWin = String(winnerId) === String(state.user?.id);
+    const isMyWin = String(item.winner_id) === String(state.user?.id);
     const diff = actual - winning;
     const pnlClass = diff >= 0 ? "profit" : "loss";
     const sign = diff >= 0 ? "+" : "";
     const winnerName = item.winner_name ||
-      state.leaderboard.find(l => String(l.id) === String(winnerId))?.name ||
+      state.leaderboard.find(l => String(l.id) === String(item.winner_id))?.name ||
       (isMyWin ? state.user.name : "Unknown");
-
     return `
       <div class="result-item">
         <div class="result-item-name">${escapeHTML(item.name)}</div>
-        <div class="result-row"><span>Winner</span><span>${winnerId ? (isMyWin ? "YOU 🏆" : escapeHTML(winnerName)) : "—"}</span></div>
+        <div class="result-row"><span>Winner</span><span>${item.winner_id ? (isMyWin ? "YOU 🏆" : escapeHTML(winnerName)) : "—"}</span></div>
         <div class="result-row"><span>Winning Bid</span><span>${winning ? formatCurrency(winning) : "—"}</span></div>
         <div class="result-row"><span>Actual Price</span><span>${formatCurrency(actual)}</span></div>
         ${isMyWin ? `<div class="result-pnl ${pnlClass}">${sign}${formatCurrency(diff)} P&L</div>` : ""}
@@ -936,10 +951,13 @@ function renderResults() {
     <div class="card" style="margin-top:0">
       <div class="card-title">YOUR SUMMARY</div>
       <div class="card-sub" style="margin-bottom:16px">FINAL STANDINGS</div>
-      <div style="display:flex;flex-direction:column;gap:10px;font-family:var(--mono);font-size:13px;">
+      <div style="display:flex;flex-direction:column;gap:10px;font-family:var(--mono);font-size:14px;">
         <div style="display:flex;justify-content:space-between;"><span style="color:var(--text-dim)">Items Won</span><span style="color:var(--gold)">${myEntry.items_won}</span></div>
         <div style="display:flex;justify-content:space-between;"><span style="color:var(--text-dim)">Total Spent</span><span>${formatCurrency(myEntry.total_spent)}</span></div>
-        <div style="display:flex;justify-content:space-between;border-top:1px solid var(--border);padding-top:10px;"><span style="color:var(--text-dim)">Rank</span><span style="color:var(--gold)">#${(state.leaderboard.findIndex(l => String(l.id) === String(state.user?.id)) + 1)}</span></div>
+        <div style="display:flex;justify-content:space-between;border-top:1px solid var(--border);padding-top:10px;">
+          <span style="color:var(--text-dim)">Rank</span>
+          <span style="color:var(--gold)">#${state.leaderboard.findIndex(l => String(l.id) === String(state.user?.id)) + 1}</span>
+        </div>
       </div>
     </div>
   ` : "";
@@ -962,6 +980,7 @@ function backToLobby() {
   state.currentRoom = null;
   state.currentItems = [];
   state.topBids = {};
+  state.activeBidders = {};
   showLobby();
 }
 
