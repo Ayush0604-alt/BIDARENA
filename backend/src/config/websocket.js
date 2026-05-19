@@ -22,8 +22,19 @@ function broadcastAll(data) {
   });
 }
 
+// FIX: broadcastToUser — send to a specific user across all rooms
+function broadcastToUser(userId, data) {
+  const msg = JSON.stringify(data);
+  Object.values(roomClients).forEach((clients) => {
+    clients.forEach((ws) => {
+      if (String(ws.userId) === String(userId) && ws.readyState === WebSocket.OPEN) {
+        ws.send(msg);
+      }
+    });
+  });
+}
+
 function createTransporter() {
-  // Support both SMTP_* and EMAIL_* env var naming (render.yaml uses EMAIL_*)
   const host = process.env.SMTP_HOST || process.env.EMAIL_HOST;
   const port = Number(process.env.SMTP_PORT || process.env.EMAIL_PORT || 587);
   const user = process.env.SMTP_USER || process.env.EMAIL_USER;
@@ -42,19 +53,14 @@ function createTransporter() {
     tls: { rejectUnauthorized: false },
   });
 
-  // Verify connection on startup (non-fatal)
   transport.verify((err) => {
-    if (err) {
-      console.error("⚠️  SMTP verify failed:", err.message);
-    } else {
-      console.log("✅ SMTP ready");
-    }
+    if (err) console.error("⚠️  SMTP verify failed:", err.message);
+    else console.log("✅ SMTP ready");
   });
 
   return transport;
 }
 
-// Lazy singleton transporter so verify runs once
 let _transporter = null;
 function getTransporter() {
   if (!_transporter) _transporter = createTransporter();
@@ -74,8 +80,34 @@ function setupWebSocket(server) {
     if (rows[0]) broadcast(rows[0].room_id, { type: "ITEM_UPDATE", data: payload });
   });
 
-  listenTo("db_notifications", (payload) => {
-    if (payload.type === "POINTS_RESET") broadcastAll({ type: "POINTS_RESET" });
+  // FIX: POINTS_RESET — broadcast to ALL connected clients individually with their updated balance
+  listenTo("db_notifications", async (payload) => {
+    if (payload.type === "POINTS_RESET") {
+      // Get all buyer users and send each their new balance
+      const { rows: buyers } = await pool.query("SELECT id, points FROM users WHERE role='buyer'");
+      const buyerMap = {};
+      buyers.forEach(b => { buyerMap[String(b.id)] = b.points; });
+
+      // Broadcast the reset event to all, then send individual POINTS_UPDATE
+      broadcastAll({ type: "POINTS_RESET" });
+
+      // Send individual updated points to each connected buyer
+      Object.values(roomClients).forEach((clients) => {
+        clients.forEach((ws) => {
+          if (ws.readyState === WebSocket.OPEN && ws.userRole === "buyer") {
+            const newPts = buyerMap[String(ws.userId)];
+            if (newPts !== undefined) {
+              ws.send(JSON.stringify({ type: "POINTS_UPDATE", data: { points: newPts } }));
+            }
+          }
+        });
+      });
+
+      // Also update the in-memory user state for each room
+      Object.keys(roomClients).forEach(roomId => {
+        broadcastLeaderboard(roomId);
+      });
+    }
   });
 
   wss.on("connection", async (ws, req) => {
@@ -134,12 +166,36 @@ async function handleJoinRoom(ws, roomId) {
       roomClients[roomId].delete(client);
     }
   }
-  roomClients[roomId].add(ws);
 
   const { rows: room } = await pool.query("SELECT * FROM rooms WHERE id=$1", [roomId]);
+  if (!room[0]) {
+    ws.send(JSON.stringify({ type: "ERROR", reason: "Room not found" }));
+    return;
+  }
 
-  // FIX 1: Admin is NEVER a participant — skip inserting them into room_participants
+  // FIX: Check max_players limit for buyers on waiting rooms
   if (ws.userRole !== "admin") {
+    const maxPlayers = room[0].max_players;
+    if (maxPlayers && room[0].status === "waiting") {
+      const { rows: existing } = await pool.query(
+        "SELECT COUNT(*) as cnt FROM room_participants WHERE room_id=$1 AND is_spectator=FALSE",
+        [roomId]
+      );
+      const alreadyJoined = await pool.query(
+        "SELECT 1 FROM room_participants WHERE room_id=$1 AND user_id=$2",
+        [roomId, ws.userId]
+      );
+      // Only block if this is a NEW participant and room is full
+      if (!alreadyJoined.rows.length && parseInt(existing.rows[0].cnt) >= maxPlayers) {
+        ws.send(JSON.stringify({
+          type: "ERROR",
+          reason: `Room is full (max ${maxPlayers} players)`
+        }));
+        ws.close(4010, "Room full");
+        return;
+      }
+    }
+
     const isSpectator = room[0]?.status !== "waiting";
     await pool.query(
       `INSERT INTO room_participants(room_id, user_id, is_spectator)
@@ -147,6 +203,8 @@ async function handleJoinRoom(ws, roomId) {
       [roomId, ws.userId, isSpectator]
     );
   }
+
+  roomClients[roomId].add(ws);
 
   const { rows: part } = await pool.query(
     "SELECT is_spectator FROM room_participants WHERE room_id=$1 AND user_id=$2",
@@ -163,7 +221,6 @@ async function handleJoinRoom(ws, roomId) {
     ORDER BY item_id, amount DESC
   `, [items.map(i => i.id)]);
 
-  // Include current live bidder list for active items
   const activeBidderMap = {};
   for (const [itemId, w] of Object.entries(activeBidWindows)) {
     activeBidderMap[itemId] = [...w.activeBidders.entries()].map(([uid, info]) => ({
@@ -171,22 +228,30 @@ async function handleJoinRoom(ws, roomId) {
     }));
   }
 
+  // FIX: include max_players in snapshot so frontend can display it
   ws.send(JSON.stringify({
     type: "ROOM_SNAPSHOT",
-    data: { room: room[0], items, topBids, isSpectator: ws.isSpectator, activeBidderMap }
+    data: {
+      room: room[0],
+      items,
+      topBids,
+      isSpectator: ws.isSpectator,
+      activeBidderMap,
+      maxPlayers: room[0].max_players || null
+    }
   }));
   await sendLeaderboard(ws, roomId);
   broadcast(roomId, { type: "USER_JOINED", data: { userId: ws.userId, name: ws.userName } });
+
+  // FIX: Send real-time participant count update to room
+  const { rows: pCount } = await pool.query(
+    "SELECT COUNT(*) as cnt FROM room_participants WHERE room_id=$1 AND is_spectator=FALSE",
+    [roomId]
+  );
+  broadcast(roomId, { type: "PARTICIPANT_COUNT", data: { count: parseInt(pCount.rows[0]?.cnt || 0), maxPlayers: room[0].max_players || null } });
 }
 
 // ─── BIDDING MODEL ───────────────────────────────────────────────────────────
-// Multiple buyers can hold live bids simultaneously on an active item.
-// Each buyer can WITHDRAW their bid at any time (points refunded).
-// When only 1 bidder remains after a withdrawal → 5-second grace period → auto-close.
-// Admin can force-end at any time (highest active bidder wins, others refunded).
-// ─────────────────────────────────────────────────────────────────────────────
-
-// activeBidWindows: itemId => { activeBidders: Map<userId, {userName, amount}>, graceTimer }
 const activeBidWindows = {};
 const bidRateLimits = {};
 
@@ -203,7 +268,6 @@ async function handlePlaceBid(ws, msg) {
     return ws.send(JSON.stringify({ type: "BID_REJECTED", reason: "Item not active" }));
   }
 
-  // Rate limiting: max 5 bids per 10 seconds per user
   const now = Date.now();
   if (!bidRateLimits[ws.userId] || now - bidRateLimits[ws.userId].firstHit > 10000) {
     bidRateLimits[ws.userId] = { count: 1, firstHit: now };
@@ -215,7 +279,6 @@ async function handlePlaceBid(ws, msg) {
     return ws.send(JSON.stringify({ type: "BID_REJECTED", reason: "Minimum bid is 1 point" }));
   }
 
-  // Current highest bid among active bidders + DB
   const { rows: highRows } = await pool.query(
     "SELECT MAX(amount) as max FROM bids WHERE item_id=$1", [itemId]
   );
@@ -234,7 +297,6 @@ async function handlePlaceBid(ws, msg) {
     }));
   }
 
-  // Check user has enough points
   const { rows: userRows } = await pool.query("SELECT points FROM users WHERE id=$1", [ws.userId]);
   if (parseFloat(amount) > parseFloat(userRows[0]?.points || 0)) {
     return ws.send(JSON.stringify({
@@ -243,21 +305,17 @@ async function handlePlaceBid(ws, msg) {
     }));
   }
 
-  // Refund user's previous bid on this item if upgrading
   if (window?.activeBidders?.has(String(ws.userId))) {
     const prev = window.activeBidders.get(String(ws.userId));
     await pool.query("UPDATE users SET points = points + $1 WHERE id=$2", [prev.amount, ws.userId]);
   }
 
-  // Deduct new bid amount
   await pool.query("UPDATE users SET points = points - $1 WHERE id=$2", [amount, ws.userId]);
   const { rows: updated } = await pool.query("SELECT points FROM users WHERE id=$1", [ws.userId]);
   ws.send(JSON.stringify({ type: "POINTS_UPDATE", data: { points: updated[0].points } }));
 
-  // Register in active bidders map
   if (!activeBidWindows[itemId]) activeBidWindows[itemId] = { activeBidders: new Map() };
 
-  // Cancel any pending grace timer if a new bidder is joining
   if (activeBidWindows[itemId].graceTimer) {
     clearTimeout(activeBidWindows[itemId].graceTimer);
     activeBidWindows[itemId].graceTimer = null;
@@ -267,7 +325,6 @@ async function handlePlaceBid(ws, msg) {
     userName: ws.userName, amount: parseFloat(amount)
   });
 
-  // Insert bid record + update item leading bid
   await pool.query("INSERT INTO bids(item_id, user_id, amount) VALUES($1, $2, $3)", [itemId, ws.userId, amount]);
   await pool.query("UPDATE items SET winner_id=$1, winning_bid=$2 WHERE id=$3", [ws.userId, amount, itemId]);
 
@@ -276,10 +333,11 @@ async function handlePlaceBid(ws, msg) {
     data: { itemId, userId: ws.userId, userName: ws.userName, amount: parseFloat(amount) }
   });
   broadcastBidderList(roomId, itemId);
+
+  // FIX: Always broadcast leaderboard after a bid
   await broadcastLeaderboard(roomId);
 }
 
-// FIX 2: WITHDRAW_BID — buyer can pull their bid; points refunded; last-bidder grace logic
 async function handleWithdrawBid(ws, msg) {
   const { itemId } = msg;
   const roomId = ws.roomId;
@@ -296,7 +354,6 @@ async function handleWithdrawBid(ws, msg) {
 
   const prevBid = window.activeBidders.get(String(ws.userId));
 
-  // Refund points
   await pool.query("UPDATE users SET points = points + $1 WHERE id=$2", [prevBid.amount, ws.userId]);
   const { rows: updated } = await pool.query("SELECT points FROM users WHERE id=$1", [ws.userId]);
   ws.send(JSON.stringify({ type: "POINTS_UPDATE", data: { points: updated[0].points } }));
@@ -313,7 +370,6 @@ async function handleWithdrawBid(ws, msg) {
   const remaining = window.activeBidders.size;
 
   if (remaining === 1) {
-    // One bidder left — 5-second grace period, others can still jump in
     const [[winnerId, winnerInfo]] = [...window.activeBidders.entries()];
     broadcast(roomId, {
       type: "LAST_BIDDER_REMAINING",
@@ -326,19 +382,17 @@ async function handleWithdrawBid(ws, msg) {
       }
     });
 
-    // Cancel any existing grace timer before setting a new one
     if (window.graceTimer) clearTimeout(window.graceTimer);
 
     window.graceTimer = setTimeout(async () => {
       const w = activeBidWindows[itemId];
-      if (!w || w.activeBidders.size !== 1) return; // someone else joined
+      if (!w || w.activeBidders.size !== 1) return;
       const { rows: check } = await pool.query("SELECT status FROM items WHERE id=$1", [itemId]);
       if (check[0]?.status !== "active") return;
       await finalizeItem(itemId, roomId, parseInt(winnerId), winnerInfo.userName, winnerInfo.amount);
     }, 5000);
 
   } else if (remaining === 0) {
-    // All bidders withdrew — fall back to highest DB bid
     if (window.graceTimer) clearTimeout(window.graceTimer);
     delete activeBidWindows[itemId];
 
@@ -349,7 +403,6 @@ async function handleWithdrawBid(ws, msg) {
       const { rows: wUser } = await pool.query("SELECT name FROM users WHERE id=$1", [maxBid[0].user_id]);
       await finalizeItem(itemId, roomId, maxBid[0].user_id, wUser[0]?.name, maxBid[0].amount);
     } else {
-      // Truly no bids — mark unsold
       await pool.query(
         "UPDATE items SET status='finished', winner_id=NULL, winning_bid=NULL, bidding_end=NOW() WHERE id=$1",
         [itemId]
@@ -359,7 +412,6 @@ async function handleWithdrawBid(ws, msg) {
       await broadcastLeaderboard(roomId);
     }
   }
-  // remaining > 1: auction continues normally, no action needed
 }
 
 function broadcastBidderList(roomId, itemId) {
@@ -392,6 +444,8 @@ async function finalizeItem(itemId, roomId, winnerId, winnerName, winningBid) {
   );
 
   broadcast(roomId, { type: "ITEM_ENDED", data: { ...item[0], winner_name: winnerName } });
+
+  // FIX: Always broadcast leaderboard after item finalization
   await broadcastLeaderboard(roomId);
   sendWinnerEmail(winnerId, itemId, winningBid).catch(e => console.error("Winner email:", e.message));
 }
@@ -413,6 +467,9 @@ async function handleStartItem(ws, msg) {
 
   const { rows } = await pool.query("SELECT * FROM items WHERE id=$1", [itemId]);
   broadcast(ws.roomId, { type: "ITEM_STARTED", data: rows[0] });
+
+  // FIX: broadcast leaderboard on item start too
+  await broadcastLeaderboard(ws.roomId);
 }
 
 async function handleEndItem(ws, msg) {
@@ -426,12 +483,10 @@ async function handleEndItem(ws, msg) {
   const window = activeBidWindows[itemId];
 
   if (window && window.activeBidders.size > 0) {
-    // Find highest active bidder
     let topId = null, topName = null, topAmt = 0;
     for (const [uid, info] of window.activeBidders.entries()) {
       if (info.amount > topAmt) { topAmt = info.amount; topId = uid; topName = info.userName; }
     }
-    // Refund all non-winners
     for (const [uid, info] of window.activeBidders.entries()) {
       if (uid !== topId) {
         await pool.query("UPDATE users SET points = points + $1 WHERE id=$2", [info.amount, uid]);
@@ -444,7 +499,6 @@ async function handleEndItem(ws, msg) {
     }
     await finalizeItem(itemId, roomId, parseInt(topId), topName, topAmt);
   } else {
-    // No active bidders — fall back to DB
     if (window) {
       if (window.graceTimer) clearTimeout(window.graceTimer);
       delete activeBidWindows[itemId];
@@ -478,7 +532,12 @@ async function handleRevealPrices(ws, msg) {
     "SELECT * FROM items WHERE room_id=$1 ORDER BY display_order", [roomId]
   );
   broadcast(roomId, { type: "PRICES_REVEALED", data: { items } });
-  await sendLeaderboardEmail(roomId);
+
+  // FIX: broadcast final leaderboard AFTER reveal so net_worth is accurate
+  await broadcastLeaderboard(roomId);
+
+  // FIX: Email sending with better error logging
+  sendLeaderboardEmail(roomId).catch(e => console.error("Leaderboard email failed:", e.message, e.stack));
 }
 
 async function sendLeaderboard(ws, roomId) {
@@ -486,10 +545,10 @@ async function sendLeaderboard(ws, roomId) {
 }
 
 async function broadcastLeaderboard(roomId) {
-  broadcast(roomId, { type: "LEADERBOARD", data: await getLeaderboard(roomId) });
+  const data = await getLeaderboard(roomId);
+  broadcast(roomId, { type: "LEADERBOARD", data });
 }
 
-// FIX 1: getLeaderboard now explicitly excludes admin role
 async function getLeaderboard(roomId) {
   const { rows: room } = await pool.query("SELECT status FROM rooms WHERE id=$1", [roomId]);
   const isFinished = room[0]?.status === "finished";
@@ -515,7 +574,7 @@ async function getLeaderboard(roomId) {
 async function sendWinnerEmail(winnerId, itemId, amount) {
   try {
     const transporter = getTransporter();
-    if (!transporter) return;
+    if (!transporter) { console.warn("⚠️  No SMTP config — skipping winner email"); return; }
     const from = process.env.EMAIL_FROM || process.env.SMTP_USER || process.env.EMAIL_USER;
     const { rows: user } = await pool.query("SELECT email, name FROM users WHERE id=$1", [winnerId]);
     const { rows: item } = await pool.query("SELECT name FROM items WHERE id=$1", [itemId]);
@@ -545,6 +604,7 @@ async function sendWinnerEmail(winnerId, itemId, amount) {
 }
 
 async function sendLeaderboardEmail(roomId) {
+  console.log(`📧 Starting leaderboard email for room ${roomId}`);
   try {
     const transporter = getTransporter();
     if (!transporter) { console.warn("⚠️  No SMTP config — skipping emails"); return; }
@@ -557,20 +617,26 @@ async function sendLeaderboardEmail(roomId) {
       [roomId]
     );
     if (!participants.length) { console.log("No participants to email"); return; }
+    console.log(`📧 Sending to ${participants.length} participants`);
 
     const { rows: room } = await pool.query("SELECT name FROM rooms WHERE id=$1", [roomId]);
     const { rows: items } = await pool.query(
       `SELECT id, name, actual_price, winner_id, winning_bid FROM items
        WHERE room_id=$1 AND status='finished' ORDER BY display_order`, [roomId]
     );
+
+    // FIX: Changed query to use net_worth calculation consistent with leaderboard
     const { rows: profitBoard } = await pool.query(
       `SELECT u.name,
-        SUM(i.actual_price - i.winning_bid) AS total_profit,
-        COUNT(i.id) AS items_won,
-        SUM(i.winning_bid) AS total_spent
-       FROM items i JOIN users u ON u.id=i.winner_id
-       WHERE i.room_id=$1 AND i.status='finished' AND i.winner_id IS NOT NULL
-       GROUP BY u.id, u.name ORDER BY total_profit DESC LIMIT 5`,
+        (10000 - rp.total_spent + COALESCE((
+          SELECT SUM(i2.actual_price) FROM items i2 WHERE i2.room_id=$1 AND i2.winner_id=u.id
+        ), 0)) AS net_worth,
+        rp.items_won,
+        rp.total_spent
+       FROM room_participants rp
+       JOIN users u ON u.id=rp.user_id
+       WHERE rp.room_id=$1 AND rp.is_spectator=FALSE AND u.role != 'admin'
+       ORDER BY net_worth DESC LIMIT 5`,
       [roomId]
     );
 
@@ -582,20 +648,20 @@ async function sendLeaderboardEmail(roomId) {
             <td style="padding:12px 16px;color:#f0f0f0;font-size:15px;">${r.name}</td>
             <td style="padding:12px 16px;color:#aaa;font-size:14px;">${r.items_won}</td>
             <td style="padding:12px 16px;color:#f5c518;font-size:14px;font-family:monospace;">₹${parseFloat(r.total_spent).toFixed(2)}</td>
-            <td style="padding:12px 16px;font-size:14px;font-family:monospace;font-weight:bold;color:${parseFloat(r.total_profit) >= 0 ? "#4ade80" : "#f87171"};">
-              ${parseFloat(r.total_profit) >= 0 ? "+" : ""}₹${parseFloat(r.total_profit).toFixed(2)}</td>
+            <td style="padding:12px 16px;font-size:14px;font-family:monospace;font-weight:bold;color:#f5c518;">
+              ₹${parseFloat(r.net_worth).toFixed(2)}</td>
           </tr>`).join("")
       : `<tr><td colspan="5" style="padding:16px;color:#888;">No winners this round</td></tr>`;
 
     for (const p of participants) {
       const myItems = items.filter(i => String(i.winner_id) === String(p.id));
-      const totalProfit = myItems.reduce((s, i) => s + parseFloat(i.actual_price) - parseFloat(i.winning_bid), 0);
-      const totalSpent = myItems.reduce((s, i) => s + parseFloat(i.winning_bid), 0);
+      const totalProfit = myItems.reduce((s, i) => s + parseFloat(i.actual_price || 0) - parseFloat(i.winning_bid || 0), 0);
+      const totalSpent = myItems.reduce((s, i) => s + parseFloat(i.winning_bid || 0), 0);
       const pc = totalProfit >= 0 ? "#4ade80" : "#f87171";
 
       const myItemsHTML = myItems.length
         ? myItems.map(i => {
-          const diff = parseFloat(i.actual_price) - parseFloat(i.winning_bid);
+          const diff = parseFloat(i.actual_price || 0) - parseFloat(i.winning_bid || 0);
           return `
               <tr style="border-bottom:1px solid #2a2a2a;">
                 <td style="padding:12px 16px;color:#f0f0f0;font-size:15px;">${i.name}</td>
@@ -642,7 +708,7 @@ async function sendLeaderboardEmail(roomId) {
                 <th style="padding:12px 16px;text-align:left;color:#999;font-size:12px;font-family:monospace;">PLAYER</th>
                 <th style="padding:12px 16px;text-align:left;color:#999;font-size:12px;font-family:monospace;">ITEMS</th>
                 <th style="padding:12px 16px;text-align:left;color:#999;font-size:12px;font-family:monospace;">SPENT</th>
-                <th style="padding:12px 16px;text-align:left;color:#999;font-size:12px;font-family:monospace;">P&amp;L</th>
+                <th style="padding:12px 16px;text-align:left;color:#999;font-size:12px;font-family:monospace;">NET WORTH</th>
               </tr></thead>
               <tbody>${top5HTML}</tbody>
             </table>
@@ -655,6 +721,7 @@ async function sendLeaderboardEmail(roomId) {
       await transporter.sendMail({ from, to: p.email, subject: `BIDArena — "${room[0]?.name}" Results & Your P&L`, html });
       console.log(`📧 Results → ${p.email}`);
     }
+    console.log(`📧 All emails sent for room ${roomId}`);
   } catch (err) {
     console.error("Leaderboard email error:", err.message, err.stack);
   }

@@ -5,7 +5,6 @@ const pool = new Pool({
   ssl: { rejectUnauthorized: false },
 });
 
-// Dedicated client held open for LISTEN/NOTIFY
 let listenerClient = null;
 const listenerCallbacks = {};
 
@@ -45,7 +44,11 @@ async function connectDB() {
 }
 
 async function initSchema() {
+  // Safe ALTER TABLE migrations
   await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS points NUMERIC(12,2) DEFAULT 10000;`).catch(() => {});
+  // FIX: add max_players column to rooms
+  await pool.query(`ALTER TABLE rooms ADD COLUMN IF NOT EXISTS max_players INT DEFAULT NULL;`).catch(() => {});
+
   await pool.query(`
     CREATE TABLE IF NOT EXISTS users (
       id SERIAL PRIMARY KEY,
@@ -63,6 +66,7 @@ async function initSchema() {
       status TEXT DEFAULT 'waiting' CHECK (status IN ('waiting','active','finished')),
       created_by INT REFERENCES users(id),
       current_item_index INT DEFAULT 0,
+      max_players INT DEFAULT NULL,
       created_at TIMESTAMPTZ DEFAULT NOW()
     );
 
@@ -97,7 +101,7 @@ async function initSchema() {
       is_spectator BOOLEAN DEFAULT FALSE,
       PRIMARY KEY (room_id, user_id)
     );
-    
+
     ALTER TABLE room_participants ADD COLUMN IF NOT EXISTS is_spectator BOOLEAN DEFAULT FALSE;
 
     CREATE OR REPLACE FUNCTION notify_bid_update() RETURNS trigger AS $$

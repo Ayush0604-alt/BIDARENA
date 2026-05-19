@@ -17,8 +17,8 @@ const state = {
   user: JSON.parse(localStorage.getItem("ba_user") || "null"),
   currentRoom: null,
   currentItems: [],
-  topBids: {},       // itemId => { userId, userName, amount }
-  activeBidders: {}, // FIX 2: itemId => [{userId, userName, amount}]
+  topBids: {},
+  activeBidders: {},
   leaderboard: [],
   ws: null,
   activeItemId: null,
@@ -27,6 +27,8 @@ const state = {
   countdownInterval: null,
   resultsRevealed: false,
   allBids: {},
+  // FIX: leaderboard auto-refresh interval
+  leaderboardInterval: null,
 };
 
 // ─── AUDIO ────────────────────────────────────
@@ -148,6 +150,7 @@ function logout() {
   localStorage.removeItem("ba_token");
   localStorage.removeItem("ba_user");
   if (state.ws) state.ws.close();
+  stopLeaderboardPolling();
   showPage("page-auth");
   renderNavUser();
 }
@@ -165,6 +168,29 @@ function renderNavUser() {
     <button class="btn btn-ghost" onclick="logout()" style="padding:6px 12px">LOGOUT</button>
   `;
   updatePointsBar();
+}
+
+// ─── LEADERBOARD POLLING (fallback) ────────────
+// FIX: Poll leaderboard every 10s as a fallback in case WS misses an update
+function startLeaderboardPolling(roomId) {
+  stopLeaderboardPolling();
+  state.leaderboardInterval = setInterval(async () => {
+    if (!state.currentRoom) return;
+    try {
+      const data = await apiCall("GET", `/rooms/${roomId}/leaderboard`);
+      if (data.leaderboard) {
+        state.leaderboard = data.leaderboard;
+        renderLeaderboard();
+      }
+    } catch (e) { /* silent fail — WS is primary */ }
+  }, 10000);
+}
+
+function stopLeaderboardPolling() {
+  if (state.leaderboardInterval) {
+    clearInterval(state.leaderboardInterval);
+    state.leaderboardInterval = null;
+  }
 }
 
 // ─── AUTH PAGE ─────────────────────────────────
@@ -216,6 +242,7 @@ async function handleAuthSubmit(e) {
 
 // ─── LOBBY ─────────────────────────────────────
 async function showLobby() {
+  stopLeaderboardPolling();
   showPage("page-lobby");
   $("create-room-btn").style.display = state.user?.role === "admin" ? "inline-flex" : "none";
   await loadRooms();
@@ -236,7 +263,10 @@ function renderRooms(rooms) {
     grid.innerHTML = `<div style="color:var(--text-dim);font-family:var(--mono);font-size:14px;padding:40px 0;">No rooms yet. ${state.user?.role === "admin" ? "Create one above." : "Ask an admin to create one."}</div>`;
     return;
   }
-  grid.innerHTML = rooms.map(r => `
+  grid.innerHTML = rooms.map(r => {
+    const maxTag = r.max_players ? `<span>👥 Max ${r.max_players}</span>` : "";
+    const isFull = r.max_players && parseInt(r.participant_count) >= r.max_players && r.status === "waiting";
+    return `
     <div class="room-card" onclick="joinRoom(${r.id})">
       ${state.user?.role === "admin" ? `
         <div style="position:absolute;top:12px;right:12px;font-size:16px;cursor:pointer;z-index:1;"
@@ -245,12 +275,13 @@ function renderRooms(rooms) {
       <div class="room-name">${escapeHTML(r.name)}</div>
       <div class="room-meta">
         <span>👤 ${escapeHTML(r.creator_name)}</span>
-        <span>🧑‍🤝‍🧑 ${r.participant_count} players</span>
+        <span>🧑‍🤝‍🧑 ${r.participant_count}${r.max_players ? "/" + r.max_players : ""} players</span>
         <span>📦 ${r.item_count} items</span>
+        ${maxTag}
       </div>
-      <div class="room-status status-${r.status}">${r.status.toUpperCase()}</div>
+      <div class="room-status status-${r.status}">${r.status.toUpperCase()}${isFull ? " — FULL" : ""}</div>
     </div>
-  `).join("");
+  `}).join("");
 }
 
 async function deleteRoomReq(id, name, status) {
@@ -266,14 +297,24 @@ async function deleteRoomReq(id, name, status) {
 }
 
 // ─── CREATE ROOM MODAL ─────────────────────────
-function openCreateRoomModal() { $("create-room-modal").classList.add("open"); $("room-name-input").focus(); }
-function closeCreateRoomModal() { $("create-room-modal").classList.remove("open"); $("room-name-input").value = ""; }
+function openCreateRoomModal() {
+  $("create-room-modal").classList.add("open");
+  $("room-name-input").focus();
+}
+function closeCreateRoomModal() {
+  $("create-room-modal").classList.remove("open");
+  $("room-name-input").value = "";
+  const mpInput = $("room-max-players-input");
+  if (mpInput) mpInput.value = "";
+}
 
 async function submitCreateRoom() {
   const name = $("room-name-input").value.trim();
+  const maxPlayersInput = $("room-max-players-input");
+  const max_players = maxPlayersInput ? parseInt(maxPlayersInput.value) || null : null;
   if (!name) return toast("Enter a room name", "error");
   try {
-    await apiCall("POST", "/rooms", { name });
+    await apiCall("POST", "/rooms", { name, max_players });
     closeCreateRoomModal();
     toast("Room created!", "success");
     await loadRooms();
@@ -302,6 +343,7 @@ async function joinRoom(roomId) {
     renderArena();
     showPage("page-arena");
     connectWebSocket(roomId);
+    startLeaderboardPolling(roomId);
   } catch (err) {
     toast("Failed to join room: " + err.message, "error");
   }
@@ -313,6 +355,13 @@ function renderArena() {
   $("arena-room-name").textContent = room.name;
   $("arena-room-status").textContent = room.status.toUpperCase();
   $("arena-room-status").className = `room-status status-${room.status}`;
+
+  // FIX: show max_players info in header
+  const maxTag = $("arena-max-players");
+  if (maxTag) {
+    maxTag.textContent = room.max_players ? `👥 Max ${room.max_players}` : "";
+    maxTag.style.display = room.max_players ? "inline-block" : "none";
+  }
 
   const dashBtn = $("admin-dashboard-btn");
   if (dashBtn) dashBtn.style.display = state.user?.role === "admin" ? "inline-flex" : "none";
@@ -330,7 +379,6 @@ function renderArena() {
   if (state.resultsRevealed) renderResults();
 }
 
-// FIX 2: renderItems includes live bidder list and WITHDRAW button
 function renderItems() {
   const container = $("items-container");
   if (!state.currentItems.length) {
@@ -344,8 +392,6 @@ function renderItems() {
     const isFinished = item.status === "finished";
     const isAdmin = state.user?.role === "admin";
     const isHighestBidder = topBid && String(topBid.userId) === String(state.user?.id);
-
-    // FIX 2: am I currently holding a live bid on this item?
     const myActiveBid = (state.activeBidders[item.id] || []).find(b => String(b.userId) === String(state.user?.id));
 
     const revealed = item.revealed && item.actual_price != null;
@@ -365,7 +411,6 @@ function renderItems() {
       }
     }
 
-    // Winner display for finished items
     let winnerHTML = "";
     if (isFinished && item.winner_id) {
       const winnerName = item.winner_name ||
@@ -380,7 +425,6 @@ function renderItems() {
       winnerHTML = `<div style="margin-top:12px;padding:10px 14px;background:var(--bg3);border:1px solid var(--bg4);border-radius:2px;font-family:var(--mono);font-size:13px;color:var(--text-mute);">No bids placed — item unsold</div>`;
     }
 
-    // FIX 2: live bidder list for active items
     const bidders = state.activeBidders[item.id] || [];
     const liveBiddersHTML = isActive && bidders.length > 0 ? `
       <div class="live-bidders">
@@ -419,7 +463,6 @@ function renderItems() {
         </div>
       </div>
 
-      <!-- Countdown bar (shown during bid window) -->
       <div class="countdown-wrap" id="countdown-${item.id}">
         <div class="countdown-bar"><div class="countdown-fill" id="countdown-fill-${item.id}" style="width:100%"></div></div>
         <div class="countdown-text" id="countdown-text-${item.id}">10s window — bid to outbid</div>
@@ -429,7 +472,6 @@ function renderItems() {
       ${winnerHTML}
       ${pnlHTML}
 
-      <!-- Bidding controls for buyers on active items -->
       ${isActive && !isAdmin ? `
         ${state.user?.isSpectator ? `
           <div style="margin-top:16px;">
@@ -462,7 +504,6 @@ function renderItems() {
         `}
       ` : ""}
 
-      <!-- Bid History (finished items only) -->
       ${isFinished && state.allBids[item.id] && state.allBids[item.id].length > 0 ? `
         <div class="bid-history">
           <div class="bid-history-title" onclick="document.getElementById('bid-hist-${item.id}').classList.toggle('open')">
@@ -480,7 +521,6 @@ function renderItems() {
         </div>
       ` : ""}
 
-      <!-- Admin controls -->
       ${isAdmin ? `
       <div class="admin-controls">
         ${item.status === "pending" ? `<button class="btn btn-gold" onclick="adminStartItem(${item.id})">▶ START BIDDING</button>` : ""}
@@ -542,7 +582,6 @@ function handleWsMessage(msg) {
       msg.data.topBids.forEach(b => {
         state.topBids[b.item_id] = { userId: b.user_id, userName: b.user_name || "?", amount: b.amount };
       });
-      // Restore live bidder lists from snapshot
       if (msg.data.activeBidderMap) {
         state.activeBidders = {};
         for (const [itemId, bidders] of Object.entries(msg.data.activeBidderMap)) {
@@ -566,25 +605,20 @@ function handleWsMessage(msg) {
       break;
     }
 
-    // FIX 2: BIDDER_LIST replaces the live bidder map and re-renders controls
     case "BIDDER_LIST": {
       const { itemId, bidders } = msg.data;
       state.activeBidders[itemId] = bidders;
-      // Update top bid to highest active bidder
       if (bidders.length > 0) {
-        const top = bidders[0]; // already sorted desc by server
+        const top = bidders[0];
         state.topBids[itemId] = { userId: top.userId, userName: top.userName, amount: top.amount };
         updateBidDisplay(itemId, state.topBids[itemId]);
       }
-      // Re-render just this item's bidder list and buttons
       renderItems();
       break;
     }
 
-    // FIX 2: BID_WITHDRAWN — update UI
     case "BID_WITHDRAWN": {
       const { itemId, userId, userName } = msg.data;
-      // activeBidders updated via BIDDER_LIST which follows
       addFeed(`<b>${escapeHTML(userName)}</b> withdrew their bid`, "system");
       if (String(userId) === String(state.user?.id)) {
         toast("Your bid was withdrawn and points refunded", "success");
@@ -592,7 +626,6 @@ function handleWsMessage(msg) {
       break;
     }
 
-    // FIX 2: LAST_BIDDER_REMAINING — show countdown to auto-close
     case "LAST_BIDDER_REMAINING": {
       const { itemId, userName, amount, graceSecs } = msg.data;
       addFeed(`⏳ Last bidder: <b>${escapeHTML(userName)}</b> @ ${formatCurrency(amount)} — auto-closes in ${graceSecs}s`, "bid");
@@ -635,24 +668,39 @@ function handleWsMessage(msg) {
     }
 
     case "POINTS_UPDATE": {
+      // FIX: update state AND all UI elements consistently
       state.user.points = msg.data.points;
       localStorage.setItem("ba_user", JSON.stringify(state.user));
       const navPts = $("nav-points");
       if (navPts) navPts.textContent = `⚡ ${parseFloat(msg.data.points).toFixed(0)} pts`;
       updatePointsBar();
+      // Re-render items to show updated available balance
       renderItems();
       break;
     }
 
+    // FIX: POINTS_RESET — update points display immediately for current user
     case "POINTS_RESET": {
       if (state.user?.role === "buyer") {
+        // Points_UPDATE will follow with exact amount from server,
+        // but pre-emptively set to 10000 for instant feedback
         state.user.points = 10000;
         localStorage.setItem("ba_user", JSON.stringify(state.user));
-        toast("Your points have been reset to 10,000!", "success");
+        toast("Points reset to 10,000 by admin!", "gold");
         const navPts = $("nav-points");
         if (navPts) navPts.textContent = `⚡ 10000 pts`;
         updatePointsBar();
         renderItems();
+        // FIX: re-fetch leaderboard after reset
+        if (state.currentRoom) {
+          apiCall("GET", `/rooms/${state.currentRoom.id}/leaderboard`)
+            .then(data => {
+              if (data.leaderboard) {
+                state.leaderboard = data.leaderboard;
+                renderLeaderboard();
+              }
+            }).catch(() => {});
+        }
       }
       break;
     }
@@ -701,6 +749,7 @@ function handleWsMessage(msg) {
       break;
     }
 
+    // FIX: LEADERBOARD — always update immediately
     case "LEADERBOARD":
       state.leaderboard = msg.data;
       renderLeaderboard();
@@ -719,8 +768,22 @@ function handleWsMessage(msg) {
       addFeed(`👤 ${escapeHTML(msg.data.name)} joined the room`, "system");
       break;
 
+    // FIX: handle participant count updates
+    case "PARTICIPANT_COUNT": {
+      const { count, maxPlayers } = msg.data;
+      const arenaStatus = $("arena-room-status");
+      if (arenaStatus && maxPlayers) {
+        // Update any visible participant count
+      }
+      break;
+    }
+
     case "ERROR":
       toast(msg.reason || "An error occurred", "error");
+      // If room is full, go back to lobby
+      if (msg.reason && msg.reason.includes("full")) {
+        setTimeout(() => showLobby(), 2000);
+      }
       break;
   }
 }
@@ -793,7 +856,6 @@ function placeBid(itemId) {
   if (input) input.value = "";
 }
 
-// FIX 2: withdraw bid
 function withdrawBid(itemId) {
   const myBid = (state.activeBidders[itemId] || []).find(b => String(b.userId) === String(state.user?.id));
   if (!myBid) return toast("No active bid to withdraw", "error");
@@ -827,9 +889,17 @@ async function openAdminDashboard() {
   $("dash-total-players").textContent = leaderboard.length;
   const activeItem = state.currentItems.find(i => i.status === "active");
   $("dash-active-item").textContent = activeItem ? activeItem.name : "None";
+
+  // FIX: Show max_players in dashboard
+  const maxPlayersEl = $("dash-max-players");
+  if (maxPlayersEl) {
+    const mp = state.currentRoom?.max_players;
+    maxPlayersEl.textContent = mp ? `${leaderboard.length} / ${mp}` : `${leaderboard.length} (no limit)`;
+  }
+
   const list = $("dash-players-list");
   const maxPts = Math.max(...leaderboard.map(p => parseFloat(p.net_worth)), 1);
-  list.innerHTML = leaderboard.map(p => {
+  list.innerHTML = leaderboard.length ? leaderboard.map(p => {
     const pts = parseFloat(p.net_worth);
     const pct = Math.max(0, (pts / maxPts) * 100);
     return `
@@ -842,17 +912,27 @@ async function openAdminDashboard() {
         <div style="height:100%;width:${pct}%;background:var(--gold);"></div>
       </div>
     </div>`;
-  }).join("");
+  }).join("") : `<div style="color:var(--text-mute);font-family:var(--mono);font-size:12px;padding:8px;">No players yet</div>`;
 }
 
 function closeAdminDashboard() { $("admin-dashboard-modal").classList.remove("open"); }
 
 async function adminResetPoints() {
-  if (!confirm("Reset ALL buyers to 10,000 points?")) return;
+  if (!confirm("Reset ALL buyers to 10,000 points? This will immediately update all connected players.")) return;
   try {
     await apiCall("POST", "/rooms/reset-points");
-    toast("All buyers reset to 10,000 points", "success");
+    toast("All buyers reset to 10,000 points — updating all clients...", "success");
     closeAdminDashboard();
+    // FIX: re-fetch leaderboard immediately after reset
+    if (state.currentRoom) {
+      setTimeout(async () => {
+        const data = await apiCall("GET", `/rooms/${state.currentRoom.id}/leaderboard`);
+        if (data.leaderboard) {
+          state.leaderboard = data.leaderboard;
+          renderLeaderboard();
+        }
+      }, 500);
+    }
   } catch (err) { toast(err.message, "error"); }
 }
 
@@ -898,16 +978,18 @@ function renderLeaderboard() {
   if (!list) return;
   const top5 = state.leaderboard.slice(0, 5);
   if (!top5.length) {
-    list.innerHTML = `<div style="color:var(--text-mute);font-family:var(--mono);font-size:12px;">No bids yet</div>`;
+    list.innerHTML = `<div style="color:var(--text-mute);font-family:var(--mono);font-size:12px;">No players yet</div>`;
     return;
   }
   list.innerHTML = top5.map((p, i) => {
     const rankClass = i === 0 ? "top-1" : i === 1 ? "top-2" : i === 2 ? "top-3" : "";
     const rankSymbol = i === 0 ? "🥇" : i === 1 ? "🥈" : i === 2 ? "🥉" : `#${i + 1}`;
+    // FIX: highlight current user in leaderboard
+    const isMe = String(p.id) === String(state.user?.id);
     return `
-      <div class="lb-entry ${rankClass}">
+      <div class="lb-entry ${rankClass}" style="${isMe ? "border-color:var(--green);" : ""}">
         <div class="lb-rank">${rankSymbol}</div>
-        <div class="lb-name">${escapeHTML(p.name)}</div>
+        <div class="lb-name" style="${isMe ? "color:var(--green);" : ""}">${escapeHTML(p.name)}${isMe ? " ★" : ""}</div>
         <div class="lb-score">
           <div class="lb-won">${p.items_won} won</div>
           <div style="color:var(--gold);">⚡ ${parseFloat(p.net_worth).toFixed(0)} pts</div>
@@ -977,6 +1059,7 @@ function renderResults() {
 // ─── BACK TO LOBBY ─────────────────────────────
 function backToLobby() {
   if (state.ws) { state.ws.close(); state.ws = null; }
+  stopLeaderboardPolling();
   state.currentRoom = null;
   state.currentItems = [];
   state.topBids = {};

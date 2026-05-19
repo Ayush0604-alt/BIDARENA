@@ -103,6 +103,8 @@
       <span class="arena-back" onclick="backToLobby()">← LOBBY</span>
       <div class="arena-room-name" id="arena-room-name">Room</div>
       <div class="room-status" id="arena-room-status"></div>
+      <!-- FIX: max players display -->
+      <div id="arena-max-players" style="display:none;font-family:var(--mono);font-size:11px;color:var(--text-dim);letter-spacing:2px;padding:3px 8px;border:1px solid var(--bg4);border-radius:2px;"></div>
       <div style="margin-left:auto;display:flex;gap:10px;align-items:center;">
         <button class="btn btn-outline" id="admin-dashboard-btn" onclick="openAdminDashboard()" style="display:none;">
           📊 DASHBOARD
@@ -157,6 +159,11 @@
         <label class="form-label">Room Name</label>
         <input class="form-input" type="text" id="room-name-input" placeholder="e.g. Sunday Auction #1" />
       </div>
+      <!-- FIX: max players field -->
+      <div class="form-group">
+        <label class="form-label">Max Players (optional — leave blank for unlimited)</label>
+        <input class="form-input" type="number" id="room-max-players-input" placeholder="e.g. 10" min="2" max="100" step="1" />
+      </div>
       <div class="modal-actions">
         <button class="btn btn-ghost" onclick="closeCreateRoomModal()">CANCEL</button>
         <button class="btn btn-gold" onclick="submitCreateRoom()">CREATE</button>
@@ -199,14 +206,19 @@
   <div class="modal-overlay" id="admin-dashboard-modal">
     <div class="modal" style="max-width: 600px;">
       <div class="modal-title">ADMIN DASHBOARD</div>
-      <div style="display:flex;gap:20px;margin-bottom:20px;">
-        <div class="card" style="flex:1;padding:16px;">
-          <div class="card-sub">TOTAL PLAYERS</div>
-          <div style="font-size:24px;color:var(--gold);" id="dash-total-players">0</div>
+      <div style="display:flex;gap:20px;margin-bottom:20px;flex-wrap:wrap;">
+        <div class="card" style="flex:1;padding:16px;min-width:120px;">
+          <div class="card-sub">PLAYERS</div>
+          <!-- FIX: shows count/max -->
+          <div style="font-size:24px;color:var(--gold);" id="dash-max-players">0</div>
         </div>
-        <div class="card" style="flex:1;padding:16px;">
+        <div class="card" style="flex:1;padding:16px;min-width:120px;">
           <div class="card-sub">ACTIVE ITEM</div>
           <div style="font-size:18px;color:var(--text);" id="dash-active-item">None</div>
+        </div>
+        <div class="card" style="flex:1;padding:16px;min-width:120px;">
+          <div class="card-sub">TOTAL PLAYERS</div>
+          <div style="font-size:24px;color:var(--gold);" id="dash-total-players">0</div>
         </div>
       </div>
 

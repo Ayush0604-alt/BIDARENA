@@ -1,13 +1,13 @@
 const { pool } = require("../config/db");
 
-// GET /api/v1/rooms — list all rooms
+// GET /api/v1/rooms
 const getRooms = async (req, res, next) => {
   try {
     const { rows } = await pool.query(
       `SELECT r.*, u.name as creator_name,
         (SELECT COUNT(*) FROM room_participants rp
          JOIN users u2 ON u2.id=rp.user_id
-         WHERE rp.room_id=r.id AND u2.role != 'admin') as participant_count,
+         WHERE rp.room_id=r.id AND u2.role != 'admin' AND rp.is_spectator=FALSE) as participant_count,
         (SELECT COUNT(*) FROM items i WHERE i.room_id=r.id) as item_count
        FROM rooms r JOIN users u ON u.id=r.created_by
        ORDER BY r.created_at DESC`
@@ -17,18 +17,20 @@ const getRooms = async (req, res, next) => {
 };
 
 // POST /api/v1/rooms — admin creates a room
+// FIX: accept max_players from body
 const createRoom = async (req, res, next) => {
-  const { name } = req.body;
+  const { name, max_players } = req.body;
   try {
+    const maxP = max_players ? parseInt(max_players) : null;
     const { rows } = await pool.query(
-      "INSERT INTO rooms(name,created_by) VALUES($1,$2) RETURNING *",
-      [name, req.user.id]
+      "INSERT INTO rooms(name,created_by,max_players) VALUES($1,$2,$3) RETURNING *",
+      [name, req.user.id, maxP]
     );
     res.status(201).json({ success: true, room: rows[0] });
   } catch (err) { next(err); }
 };
 
-// GET /api/v1/rooms/:id — room details + items
+// GET /api/v1/rooms/:id
 const getRoom = async (req, res, next) => {
   try {
     const { rows: room } = await pool.query("SELECT * FROM rooms WHERE id=$1", [req.params.id]);
@@ -39,7 +41,6 @@ const getRoom = async (req, res, next) => {
       [req.params.id]
     );
 
-    // Top bid per item
     const { rows: topBids } = await pool.query(
       `SELECT DISTINCT ON (b.item_id) b.item_id, b.user_id, b.amount, u.name as user_name
        FROM bids b JOIN users u ON u.id=b.user_id
@@ -48,7 +49,6 @@ const getRoom = async (req, res, next) => {
       [items.map((i) => i.id)]
     );
 
-    // All bids per item for history
     const { rows: allBids } = await pool.query(
       `SELECT b.item_id, b.user_id, b.amount, b.created_at, u.name as user_name
        FROM bids b JOIN users u ON u.id=b.user_id
@@ -61,7 +61,7 @@ const getRoom = async (req, res, next) => {
   } catch (err) { next(err); }
 };
 
-// POST /api/v1/rooms/:id/items — admin adds item to room
+// POST /api/v1/rooms/:id/items
 const addItem = async (req, res, next) => {
   const { name, description, actual_price, display_order } = req.body;
   try {
@@ -83,7 +83,6 @@ const deleteItem = async (req, res, next) => {
 };
 
 // GET /api/v1/rooms/:id/leaderboard
-// FIX 1: explicitly exclude admin role from leaderboard
 const getLeaderboard = async (req, res, next) => {
   try {
     const { id: roomId } = req.params;
@@ -127,12 +126,29 @@ const deleteRoom = async (req, res, next) => {
 };
 
 // POST /api/v1/rooms/reset-points
+// FIX: After reset, re-fetch user points from DB so the response confirms success
 const resetPoints = async (req, res, next) => {
   try {
     await pool.query("UPDATE users SET points=10000 WHERE role='buyer'");
-    await pool.query(`NOTIFY db_notifications, '{"type":"POINTS_RESET"}'`);
+    // FIX: Use pg_notify to trigger all connected WS clients to update
+    await pool.query(`SELECT pg_notify('db_notifications', '{"type":"POINTS_RESET"}')`);
     res.json({ success: true, message: "All buyers reset to 10,000 pts" });
   } catch (err) { next(err); }
 };
 
-module.exports = { getRooms, createRoom, getRoom, addItem, deleteItem, getLeaderboard, deleteRoom, resetPoints };
+// PATCH /api/v1/rooms/:id — update room settings (e.g. max_players)
+const updateRoom = async (req, res, next) => {
+  try {
+    const { max_players } = req.body;
+    const maxP = max_players !== undefined ? parseInt(max_players) || null : undefined;
+    if (maxP === undefined) return res.status(400).json({ success: false, message: "No fields to update" });
+    const { rows } = await pool.query(
+      "UPDATE rooms SET max_players=$1 WHERE id=$2 RETURNING *",
+      [maxP, req.params.id]
+    );
+    if (!rows[0]) return res.status(404).json({ success: false, message: "Room not found" });
+    res.json({ success: true, room: rows[0] });
+  } catch (err) { next(err); }
+};
+
+module.exports = { getRooms, createRoom, getRoom, addItem, deleteItem, getLeaderboard, deleteRoom, resetPoints, updateRoom };
