@@ -7,30 +7,29 @@ const cookieParser = require("cookie-parser");
 
 const app = express();
 
-app.use(helmet({
-  contentSecurityPolicy: false,
-}));
+app.use(helmet({ contentSecurityPolicy: false }));
 app.use(morgan("dev"));
 app.use(cors({
-  origin: true, // Allow Render deployment seamlessly
-  credentials: true
+  origin: process.env.CLIENT_ORIGIN || true,
+  credentials: true,
 }));
 app.use(express.json());
 app.use(cookieParser());
 
-// Routes
-app.use("/api/v1/auth", require("./routes/auth.routes"));
+// ─── API Routes ────────────────────────────────────────────────────────────
+app.use("/api/v1/auth",  require("./routes/auth.routes"));
 app.use("/api/v1/rooms", require("./routes/room.routes"));
 
-app.get("/health", (req, res) => res.json({ status: "ok" }));
+app.get("/health", (req, res) => res.json({ status: "ok", ts: new Date().toISOString() }));
 
-// Serve Frontend
-app.use(express.static(path.join(__dirname, "../../frontend")));
+// ─── Serve Frontend (SPA) ──────────────────────────────────────────────────
+const frontendPath = path.join(__dirname, "../../frontend");
+app.use(express.static(frontendPath));
 app.use((req, res) => {
-  res.sendFile(path.join(__dirname, "../../frontend/index.html"));
+  res.sendFile(path.join(frontendPath, "index.html"));
 });
 
-// Error handler
+// ─── Global Error Handler ──────────────────────────────────────────────────
 app.use(require("./middleware/error.middleware"));
 
 module.exports = app;
