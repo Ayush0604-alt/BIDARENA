@@ -2,8 +2,8 @@
 //  BIDArena — Main Application
 // ═══════════════════════════════════════════════
 
-const API = window.location.hostname === "localhost" || window.location.hostname === "127.0.0.1" 
-  ? "http://localhost:5000/api/v1" 
+const API = window.location.hostname === "localhost" || window.location.hostname === "127.0.0.1"
+  ? "http://localhost:5000/api/v1"
   : "/api/v1";
 
 const WS_PROTOCOL = window.location.protocol === "https:" ? "wss:" : "ws:";
@@ -36,7 +36,7 @@ function playSound(type) {
   osc.connect(gain);
   gain.connect(audioCtx.destination);
   const now = audioCtx.currentTime;
-  
+
   if (type === 'tick') {
     osc.type = 'sine'; osc.frequency.setValueAtTime(800, now); osc.frequency.exponentialRampToValueAtTime(10, now + 0.1);
     gain.gain.setValueAtTime(0.3, now); gain.gain.exponentialRampToValueAtTime(0.01, now + 0.1);
@@ -54,7 +54,7 @@ function playSound(type) {
 
 function escapeHTML(str) {
   if (!str) return "";
-  return str.replace(/[&<>'"]/g, tag => ({'&': '&amp;', '<': '&lt;', '>': '&gt;', "'": '&#39;', '"': '&quot;'}[tag]));
+  return str.replace(/[&<>'"]/g, tag => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', "'": '&#39;', '"': '&quot;' }[tag]));
 }
 
 function updatePointsBar() {
@@ -76,7 +76,7 @@ function showWinnerBanner(userName, itemName, amount) {
   if (!banner) return;
   banner.textContent = `🏆 ${userName} won ${itemName} for ${formatCurrency(amount)}!`;
   banner.classList.add('show');
-  setTimeout(() => banner.classList.remove('show'), 3000);
+  setTimeout(() => banner.classList.remove('show'), 4000);
 }
 
 function toggleMobileSidebar() {
@@ -117,7 +117,6 @@ function addFeed(msg, type = "system") {
   el.className = `feed-entry ${type}`;
   el.innerHTML = `<span class="feed-time">${timeNow()}</span>${msg}`;
   feed.prepend(el);
-  // Keep only 50 entries
   while (feed.children.length > 50) feed.lastChild.remove();
 }
 
@@ -177,7 +176,7 @@ function showAuthPage() {
   $("auth-toggle-link").onclick = toggleAuthMode;
 }
 
-let authMode = "login"; // "login" | "register"
+let authMode = "login";
 
 function toggleAuthMode() {
   authMode = authMode === "login" ? "register" : "login";
@@ -246,7 +245,10 @@ function renderRooms(rooms) {
   }
   grid.innerHTML = rooms.map(r => `
     <div class="room-card" onclick="joinRoom(${r.id})">
-      ${state.user?.role === "admin" ? `<div style="position:absolute; top:12px; right:12px; font-size:16px; cursor:pointer;" onclick="event.stopPropagation(); deleteRoomReq(${r.id})">🗑️</div>` : ""}
+      ${state.user?.role === "admin" ? `
+        <div style="position:absolute; top:12px; right:12px; font-size:16px; cursor:pointer; z-index:1;"
+             onclick="event.stopPropagation(); deleteRoomReq(${r.id}, '${escapeHTML(r.name)}', '${r.status}')">🗑️</div>
+      ` : ""}
       <div class="room-name">${escapeHTML(r.name)}</div>
       <div class="room-meta">
         <span>👤 ${escapeHTML(r.creator_name)}</span>
@@ -258,8 +260,13 @@ function renderRooms(rooms) {
   `).join("");
 }
 
-async function deleteRoomReq(id) {
-  if (!confirm("Are you sure you want to delete this room?")) return;
+async function deleteRoomReq(id, name, status) {
+  const statusLabel = status === "finished" ? "finished" : status === "active" ? "currently active" : "waiting";
+  const confirmMsg = status === "active"
+    ? `⚠️ "${name}" is currently active! Deleting will end the auction for all participants. Are you sure?`
+    : `Delete room "${name}"? This cannot be undone.`;
+
+  if (!confirm(confirmMsg)) return;
   try {
     await apiCall("DELETE", `/rooms/${id}`);
     toast("Room deleted", "success");
@@ -326,6 +333,10 @@ function renderArena() {
   $("arena-room-status").textContent = room.status.toUpperCase();
   $("arena-room-status").className = `room-status status-${room.status}`;
 
+  // Show admin dashboard button only for admin
+  const dashBtn = $("admin-dashboard-btn");
+  if (dashBtn) dashBtn.style.display = state.user?.role === "admin" ? "inline-flex" : "none";
+
   renderItems();
 
   if (state.user?.role === "admin") {
@@ -370,6 +381,21 @@ function renderItems() {
       }
     }
 
+    // Winner display for finished items
+    let winnerHTML = "";
+    if (isFinished && item.winner_id) {
+      const winnerName = item.winner_name ||
+        (state.leaderboard.find(l => String(l.id) === String(item.winner_id))?.name) ||
+        (String(item.winner_id) === String(state.user?.id) ? state.user.name : "Unknown");
+      const isMyWin = String(item.winner_id) === String(state.user?.id);
+      winnerHTML = `
+        <div style="margin-top:12px;padding:10px 14px;background:rgba(245,197,24,0.06);border:1px solid rgba(245,197,24,0.25);border-radius:2px;font-family:var(--mono);font-size:12px;">
+          🏆 Won by <strong style="color:var(--gold);">${escapeHTML(winnerName)}</strong>${isMyWin ? ' <span style="color:var(--green);">(You!)</span>' : ''} for ${formatCurrency(item.winning_bid)}
+        </div>`;
+    } else if (isFinished && !item.winner_id) {
+      winnerHTML = `<div style="margin-top:12px;padding:10px 14px;background:var(--bg3);border:1px solid var(--bg4);border-radius:2px;font-family:var(--mono);font-size:12px;color:var(--text-mute);">No bids placed — item unsold</div>`;
+    }
+
     return `
     <div class="item-card ${isActive ? "active-item" : ""} ${isFinished ? "finished-item" : ""}" id="item-card-${item.id}">
       <div class="item-number">ITEM ${String(idx + 1).padStart(2, "0")} / ${String(state.currentItems.length).padStart(2, "0")}</div>
@@ -378,7 +404,7 @@ function renderItems() {
 
       <div class="bid-info">
         <div class="bid-block">
-          <div class="bid-label">Current High Bid</div>
+          <div class="bid-label">${isActive ? "Leading Bid" : isFinished ? "Winning Bid" : "Current High Bid"}</div>
           <div class="bid-amount ${topBid ? "" : "dim"}" id="bid-amount-${item.id}">
             ${topBid ? formatCurrency(topBid.amount) : "—"}
           </div>
@@ -395,12 +421,13 @@ function renderItems() {
       <!-- Countdown bar (shown during bid window) -->
       <div class="countdown-wrap" id="countdown-${item.id}">
         <div class="countdown-bar"><div class="countdown-fill" id="countdown-fill-${item.id}" style="width:100%"></div></div>
-        <div class="countdown-text" id="countdown-text-${item.id}">10s to confirm bid...</div>
+        <div class="countdown-text" id="countdown-text-${item.id}">10s window — bid to outbid</div>
       </div>
 
+      ${winnerHTML}
       ${pnlHTML}
 
-      <!-- Bidding controls for buyers -->
+      <!-- Bidding controls for buyers on active items -->
       ${isActive && !isAdmin ? `
         ${state.user?.isSpectator ? `
           <div style="margin-top:16px;">
@@ -417,7 +444,7 @@ function renderItems() {
             <button class="btn btn-gold" id="bid-btn-${item.id}"
               onclick="placeBid(${item.id})"
               ${isHighestBidder ? "disabled" : ""}>
-              ${isHighestBidder ? "HIGHEST BIDDER" : "PLACE BID"}
+              ${isHighestBidder ? "LEADING BID" : "PLACE BID"}
             </button>
           </div>
           <div style="font-family:var(--mono);font-size:11px;color:var(--text-mute);margin-top:6px;">
@@ -425,7 +452,7 @@ function renderItems() {
           </div>
         `}
       ` : ""}
-      
+
       <!-- Bid History (finished items only) -->
       ${isFinished && state.allBids[item.id] && state.allBids[item.id].length > 0 ? `
         <div class="bid-history">
@@ -499,89 +526,87 @@ function wsSend(obj) {
 // ─── WS MESSAGE HANDLER ────────────────────────
 function handleWsMessage(msg) {
   switch (msg.type) {
+
     case "ROOM_SNAPSHOT": {
-      // Reconnection recovery flicker fix
-      const isDifferent = JSON.stringify(state.currentItems) !== JSON.stringify(msg.data.items) 
-                          || state.currentRoom?.status !== msg.data.room?.status;
-      
+      const isDifferent = JSON.stringify(state.currentItems) !== JSON.stringify(msg.data.items)
+        || state.currentRoom?.status !== msg.data.room?.status;
+
       state.currentRoom = msg.data.room;
       state.currentItems = msg.data.items;
       if (msg.data.isSpectator !== undefined) {
         state.user.isSpectator = msg.data.isSpectator;
         updatePointsBar();
       }
-      
+
       msg.data.topBids.forEach(b => {
         state.topBids[b.item_id] = { userId: b.user_id, userName: b.user_name || "?", amount: b.amount };
       });
-      
+
       if (isDifferent) renderItems();
-      
-      // Restore countdown if active
-      const activeItem = state.currentItems.find(i => i.status === "active");
-      if (activeItem && state.bidWindowActive && state.activeItemId === activeItem.id) {
-        // If we want to fully sync we need started_at, but snapshot doesn't give it.
-        // Handled below in BID_WINDOW_OPEN
-      }
       break;
     }
+
     case "REAUTH_REQUIRED":
       toast(msg.reason + " - Please login again.", "error");
       setTimeout(logout, 3000);
       break;
 
     case "BID_WINDOW_OPEN": {
+      // Someone has placed a bid — 10s window opened. Show countdown.
+      // This does NOT mean they won; admin must end the item for that.
       const { itemId, userId, userName, amount, expiresIn, bidding_window_started_at } = msg.data;
       state.bidWindowActive = true;
       state.bidWindowUserId = userId;
       state.activeItemId = itemId;
-      // Update display
+
       updateBidDisplay(itemId, { userId, userName, amount });
-      
-      // Timer sync calculation
+
       let remaining = expiresIn;
       if (bidding_window_started_at) {
         const elapsed = (Date.now() - bidding_window_started_at) / 1000;
         remaining = Math.max(1, expiresIn - elapsed);
       }
-      
+
       startCountdown(itemId, remaining);
-      
-      // Disable bid button for item if you're the highest bidder
       refreshBidButton(itemId, userId);
-      addFeed(`<b>${userName}</b> bid ${formatCurrency(amount)}`, "bid");
-      toast(`${userName} placed a bid of ${formatCurrency(amount)}!`, "gold");
+
+      addFeed(`<b>${escapeHTML(userName)}</b> placed bid of ${formatCurrency(amount)}`, "bid");
       playSound("tick");
       break;
     }
 
     case "BID_COMMITTED": {
+      // The 10s window expired — this bid is now the confirmed leading bid.
+      // The item is still active; admin will end it to declare the final winner.
       const { itemId, userId, userName, amount } = msg.data;
       state.topBids[itemId] = { userId, userName, amount };
-      
+
       if (!state.allBids[itemId]) state.allBids[itemId] = [];
       state.allBids[itemId].unshift({ item_id: itemId, user_id: userId, amount, user_name: userName });
-      
+
       state.bidWindowActive = false;
       stopCountdown(itemId);
       updateBidDisplay(itemId, { userId, userName, amount });
-      refreshBidButton(itemId, null);
-      
-      addFeed(`✓ BID CONFIRMED — ${userName} @ ${formatCurrency(amount)}`, "win");
-      showWinnerBanner(userName, state.currentItems.find(i=>i.id===itemId)?.name || "Item", amount);
-      playSound("success");
-      if (String(userId) === String(state.user?.id)) toast("Your bid was confirmed! 🏆", "success");
+
+      // Re-enable bidding for everyone except the current leader
+      refreshBidButton(itemId, userId);
+
+      addFeed(`✓ Leading bid confirmed: <b>${escapeHTML(userName)}</b> @ ${formatCurrency(amount)}`, "system");
+
+      // Only notify the current leader (not a "won" announcement)
+      if (String(userId) === String(state.user?.id)) {
+        toast(`Your bid of ${formatCurrency(amount)} is now the leading bid`, "success");
+      }
       break;
     }
 
     case "POINTS_UPDATE": {
       state.user.points = msg.data.points;
       localStorage.setItem("ba_user", JSON.stringify(state.user));
-      // Update nav points display
       const navPts = $("nav-points");
       if (navPts) navPts.textContent = `⚡ ${parseFloat(msg.data.points).toFixed(0)} pts`;
       updatePointsBar();
-      renderItems(); // to update available points text in bid row
+      renderItems();
       break;
     }
 
@@ -603,25 +628,48 @@ function handleWsMessage(msg) {
       toast(msg.reason, "error");
       break;
 
-
     case "ITEM_STARTED": {
       const item = msg.data;
       updateItemInState(item);
       renderItems();
-      addFeed(`📦 Bidding started: <b>${item.name}</b>`, "system");
+      addFeed(`📦 Bidding started: <b>${escapeHTML(item.name)}</b>`, "system");
       toast(`Bidding open: ${item.name}`, "gold");
       break;
     }
 
-    case "ITEM_UPDATE":
     case "ITEM_ENDED": {
+      // Admin has ended this item — THIS is when the winner is declared
       const item = msg.data;
+
+      // Stop any active countdown for this item
+      stopCountdown(item.id);
+      state.bidWindowActive = false;
+
+      // Persist winner name onto item state for rendering
       updateItemInState(item);
       renderItems();
-      if (msg.type === "ITEM_ENDED") {
-        const winner = state.topBids[item.id];
-        addFeed(`🔔 Item ended: <b>${item.name}</b>${winner ? " — Won by " + winner.userName : ""}`, "win");
+
+      const winnerName = item.winner_name;
+      if (winnerName) {
+        const isMyWin = String(item.winner_id) === String(state.user?.id);
+        addFeed(`🏆 <b>${escapeHTML(item.name)}</b> sold to <b>${escapeHTML(winnerName)}</b> for ${formatCurrency(item.winning_bid)}`, "win");
+        showWinnerBanner(winnerName, item.name, item.winning_bid);
+        playSound("success");
+        if (isMyWin) {
+          toast(`🏆 Congratulations! You won ${item.name}!`, "success");
+        } else {
+          toast(`${winnerName} won ${item.name} for ${formatCurrency(item.winning_bid)}`, "gold");
+        }
+      } else {
+        addFeed(`🔔 <b>${escapeHTML(item.name)}</b> — no bids, item unsold`, "system");
+        toast(`Bidding ended for ${item.name} — no winner`, "info");
       }
+      break;
+    }
+
+    case "ITEM_UPDATE": {
+      updateItemInState(msg.data);
+      renderItems();
       break;
     }
 
@@ -633,21 +681,21 @@ function handleWsMessage(msg) {
     case "PRICES_REVEALED":
       msg.data.items.forEach(i => updateItemInState(i));
       state.resultsRevealed = true;
-      renderItems();
-      renderResults();
+      if (state.currentRoom) state.currentRoom.status = "finished";
+      renderArena();
       toast("🎉 Actual prices revealed!", "gold");
       addFeed("🏁 GAME OVER — Prices revealed!", "win");
       break;
 
     case "USER_JOINED":
-      addFeed(`👤 ${msg.data.name} joined the room`, "system");
+      addFeed(`👤 ${escapeHTML(msg.data.name)} joined the room`, "system");
       break;
   }
 }
 
 function updateItemInState(item) {
   const idx = state.currentItems.findIndex(i => i.id === item.id);
-  if (idx !== -1) state.currentItems[idx] = item;
+  if (idx !== -1) state.currentItems[idx] = { ...state.currentItems[idx], ...item };
 }
 
 function updateBidDisplay(itemId, { userId, userName, amount }) {
@@ -662,7 +710,7 @@ function refreshBidButton(itemId, highBidderUserId) {
   if (!btn) return;
   const isMe = String(highBidderUserId) === String(state.user?.id);
   btn.disabled = isMe;
-  btn.textContent = isMe ? "HIGHEST BIDDER" : "PLACE BID";
+  btn.textContent = isMe ? "LEADING BID" : "PLACE BID";
 }
 
 // ─── COUNTDOWN ─────────────────────────────────
@@ -677,7 +725,7 @@ function startCountdown(itemId, seconds) {
 
   let remaining = Math.ceil(seconds);
   fill.style.width = "100%";
-  text.textContent = `${remaining}s — confirm window`;
+  text.textContent = `${remaining}s — bid now to outbid`;
 
   const interval = setInterval(() => {
     remaining--;
@@ -687,7 +735,7 @@ function startCountdown(itemId, seconds) {
     }
     playSound("tick");
     fill.style.width = `${(remaining / seconds) * 100}%`;
-    text.textContent = `${remaining}s — confirm window`;
+    text.textContent = `${remaining}s — bid now to outbid`;
   }, 1000);
 
   state.countdownInterval = { id: itemId, interval };
@@ -723,26 +771,30 @@ function adminStartItem(itemId) {
 }
 
 function adminEndItem(itemId) {
+  const item = state.currentItems.find(i => i.id === itemId);
+  const topBid = state.topBids[itemId];
+  const confirmMsg = topBid
+    ? `End bidding for "${item?.name}"?\n\nCurrent leader: ${topBid.userName} @ ${formatCurrency(topBid.amount)}\n\nThey will be declared the winner.`
+    : `End bidding for "${item?.name}"? No bids have been placed — item will be unsold.`;
+
+  if (!confirm(confirmMsg)) return;
   wsSend({ type: "ADMIN_END_ITEM", itemId });
 }
 
 function adminRevealPrices() {
-  if (!confirm("Reveal actual prices to all players? This ends the game.")) return;
+  if (!confirm("Reveal actual prices to all players? This ends the game and sends result emails to all participants.")) return;
   wsSend({ type: "ADMIN_REVEAL_PRICES", roomId: state.currentRoom.id });
 }
 
 async function openAdminDashboard() {
   $("admin-dashboard-modal").classList.add("open");
-  
-  // Total players
-  const { leaderboard } = state; // fetched automatically
+
+  const { leaderboard } = state;
   $("dash-total-players").textContent = leaderboard.length;
-  
-  // Active item
+
   const activeItem = state.currentItems.find(i => i.status === "active");
   $("dash-active-item").textContent = activeItem ? activeItem.name : "None";
-  
-  // Players list
+
   const list = $("dash-players-list");
   const maxPts = Math.max(...leaderboard.map(p => parseFloat(p.net_worth)), 1);
   list.innerHTML = leaderboard.map(p => {
@@ -799,7 +851,6 @@ async function submitAddItem() {
     await apiCall("POST", `/rooms/${state.currentRoom.id}/items`, { name, description, actual_price, display_order });
     closeAddItemModal();
     toast("Item added!", "success");
-    // Refresh room data
     const data = await apiCall("GET", `/rooms/${state.currentRoom.id}`);
     state.currentItems = data.items;
     renderItems();
@@ -837,7 +888,7 @@ function renderLeaderboard() {
     return `
       <div class="lb-entry ${rankClass}">
         <div class="lb-rank">${rankSymbol}</div>
-        <div class="lb-name">${p.name}</div>
+        <div class="lb-name">${escapeHTML(p.name)}</div>
         <div class="lb-score">
           <div class="lb-won">${p.items_won} won</div>
           <div style="color:var(--gold);">⚡ ${parseFloat(p.net_worth).toFixed(0)} pts</div>
@@ -865,11 +916,14 @@ function renderResults() {
     const diff = actual - winning;
     const pnlClass = diff >= 0 ? "profit" : "loss";
     const sign = diff >= 0 ? "+" : "";
+    const winnerName = item.winner_name ||
+      state.leaderboard.find(l => String(l.id) === String(winnerId))?.name ||
+      (isMyWin ? state.user.name : "Unknown");
 
     return `
       <div class="result-item">
-        <div class="result-item-name">${item.name}</div>
-        <div class="result-row"><span>Winner</span><span>${isMyWin ? "YOU 🏆" : (state.leaderboard.find(l => String(l.id) === String(winnerId))?.name || "Unknown")}</span></div>
+        <div class="result-item-name">${escapeHTML(item.name)}</div>
+        <div class="result-row"><span>Winner</span><span>${winnerId ? (isMyWin ? "YOU 🏆" : escapeHTML(winnerName)) : "—"}</span></div>
         <div class="result-row"><span>Winning Bid</span><span>${winning ? formatCurrency(winning) : "—"}</span></div>
         <div class="result-row"><span>Actual Price</span><span>${formatCurrency(actual)}</span></div>
         ${isMyWin ? `<div class="result-pnl ${pnlClass}">${sign}${formatCurrency(diff)} P&L</div>` : ""}
@@ -877,7 +931,6 @@ function renderResults() {
     `;
   }).join("");
 
-  // My summary
   const myEntry = state.leaderboard.find(l => String(l.id) === String(state.user?.id));
   const summaryHTML = myEntry ? `
     <div class="card" style="margin-top:0">

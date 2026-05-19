@@ -115,7 +115,7 @@ async function handleJoinRoom(ws, roomId) {
   }
   ws.roomId = roomId;
   if (!roomClients[roomId]) roomClients[roomId] = new Set();
-  
+
   // Close duplicate connections for this user in this room
   for (const client of roomClients[roomId]) {
     if (String(client.userId) === String(ws.userId) && client !== ws) {
@@ -124,17 +124,17 @@ async function handleJoinRoom(ws, roomId) {
       roomClients[roomId].delete(client);
     }
   }
-  
+
   roomClients[roomId].add(ws);
 
   const { rows: room } = await pool.query("SELECT * FROM rooms WHERE id=$1", [roomId]);
-  
+
   // Ensure participant row exists
   await pool.query(
     `INSERT INTO room_participants(room_id,user_id,is_spectator) VALUES($1,$2,$3) ON CONFLICT DO NOTHING`,
     [roomId, ws.userId, room[0]?.status !== "waiting" && ws.userRole !== "admin"]
   );
-  
+
   const { rows: part } = await pool.query("SELECT is_spectator FROM room_participants WHERE room_id=$1 AND user_id=$2", [roomId, ws.userId]);
   ws.isSpectator = part[0]?.is_spectator || false;
 
@@ -156,7 +156,7 @@ async function handleJoinRoom(ws, roomId) {
   broadcast(roomId, { type: "USER_JOINED", data: { userId: ws.userId, name: ws.userName } });
 }
 
-// Active bid windows: itemId => { timeout, highBidderId, amount }
+// Active bid windows: itemId => { timeout, highBidderId, highBidderName, amount }
 const activeBidWindows = {};
 
 // Rate limiter: userId => { count, firstHit }
@@ -189,7 +189,7 @@ async function handlePlaceBid(ws, msg) {
   );
   const currentHighDB = parseFloat(highRows[0]?.max || 0);
   const currentHigh = Math.max(currentHighDB, window?.amount || 0);
-  
+
   if (parseFloat(amount) < 1) {
     return ws.send(JSON.stringify({ type: "BID_REJECTED", reason: "Minimum bid is 1 point" }));
   }
@@ -234,7 +234,8 @@ async function handlePlaceBid(ws, msg) {
   const { rows: reserveUpdated } = await pool.query("SELECT points FROM users WHERE id=$1", [ws.userId]);
   ws.send(JSON.stringify({ type: "POINTS_UPDATE", data: { points: reserveUpdated[0].points } }));
 
-  // Start 10-second window — block others during this time
+  // Start 10-second window — if no one outbids, this bid becomes the leading bid
+  // NOTE: The bid is NOT "won" yet — the item auction must be ended by admin to finalise.
   if (window?.timeout) clearTimeout(window.timeout);
 
   activeBidWindows[itemId] = {
@@ -242,30 +243,34 @@ async function handlePlaceBid(ws, msg) {
     highBidderName: ws.userName,
     amount: parseFloat(amount),
     timeout: setTimeout(async () => {
-      // Commit bid after 10s with no challenge
+      // After 10s with no challenge, commit this as the current leading bid record
+      // BUT the item is still active — admin must end it to declare a winner
       await pool.query(
         "INSERT INTO bids(item_id,user_id,amount) VALUES($1,$2,$3)",
         [itemId, ws.userId, amount]
       );
-      delete activeBidWindows[itemId];
-      // Update item's winning bid
+
+      // Update item's current leading bid (not yet "won")
       await pool.query(
         "UPDATE items SET winner_id=$1, winning_bid=$2 WHERE id=$3",
         [ws.userId, amount, itemId]
       );
-      
+
+      // Clear the window so others can bid again
+      delete activeBidWindows[itemId];
+
+      // Tell everyone the bid is now the confirmed leading bid (window closed)
       broadcast(roomId, {
         type: "BID_COMMITTED",
         data: { itemId, userId: ws.userId, userName: ws.userName, amount },
       });
+
       await broadcastLeaderboard(roomId);
-      
-      // Send winner email
-      sendWinnerEmail(ws.userId, itemId, amount).catch(console.error);
+      // NO winner email here — winner is only declared when admin ends the item
     }, 10000),
   };
 
-  // Tell everyone a bid is pending (10s window open)
+  // Tell everyone a bid window is open (10s countdown)
   broadcast(roomId, {
     type: "BID_WINDOW_OPEN",
     data: { itemId, userId: ws.userId, userName: ws.userName, amount, expiresIn: 10, bidding_window_started_at: Date.now() },
@@ -275,8 +280,8 @@ async function handlePlaceBid(ws, msg) {
 async function handleStartItem(ws, msg) {
   if (ws.userRole !== "admin") return;
   const { itemId } = msg;
-  
-  // Enforce item order
+
+  // Enforce only one active item at a time
   const { rows: prevItems } = await pool.query(
     "SELECT id FROM items WHERE room_id=$1 AND status='active'",
     [ws.roomId]
@@ -289,10 +294,10 @@ async function handleStartItem(ws, msg) {
     "UPDATE items SET status='active', bidding_start=NOW() WHERE id=$1",
     [itemId]
   );
-  
+
   // Set room to active
   await pool.query("UPDATE rooms SET status='active' WHERE id=$1", [ws.roomId]);
-  // trigger from DB notify — but also broadcast directly for speed
+
   const { rows } = await pool.query("SELECT * FROM items WHERE id=$1", [itemId]);
   broadcast(ws.roomId, { type: "ITEM_STARTED", data: rows[0] });
 }
@@ -301,7 +306,7 @@ async function handleEndItem(ws, msg) {
   if (ws.userRole !== "admin") return;
   const { itemId } = msg;
 
-  // Clear any pending bid window and commit it immediately
+  // If there's an active bid window, commit it immediately
   if (activeBidWindows[itemId]) {
     clearTimeout(activeBidWindows[itemId].timeout);
     const w = activeBidWindows[itemId];
@@ -313,11 +318,8 @@ async function handleEndItem(ws, msg) {
       "UPDATE items SET winner_id=$1, winning_bid=$2 WHERE id=$3",
       [w.highBidderId, w.amount, itemId]
     );
-    // Points are already deducted on place bid, no need to deduct again.
+    // Points already deducted when bid was placed
     delete activeBidWindows[itemId];
-    
-    // Send winner email
-    sendWinnerEmail(w.highBidderId, itemId, w.amount).catch(console.error);
   }
 
   await pool.query(
@@ -325,7 +327,7 @@ async function handleEndItem(ws, msg) {
     [itemId]
   );
 
-  // Update room_participants totals
+  // Update room_participants totals for the winner
   const { rows: item } = await pool.query("SELECT * FROM items WHERE id=$1", [itemId]);
   if (item[0]?.winner_id) {
     await pool.query(
@@ -335,8 +337,28 @@ async function handleEndItem(ws, msg) {
     );
   }
 
-  broadcast(ws.roomId, { type: "ITEM_ENDED", data: item[0] });
+  // Look up winner name for the broadcast
+  let winnerName = null;
+  if (item[0]?.winner_id) {
+    const { rows: winnerRows } = await pool.query("SELECT name FROM users WHERE id=$1", [item[0].winner_id]);
+    winnerName = winnerRows[0]?.name || null;
+  }
+
+  // Broadcast ITEM_ENDED with full winner info — this is the single source of truth for "X won"
+  broadcast(ws.roomId, {
+    type: "ITEM_ENDED",
+    data: {
+      ...item[0],
+      winner_name: winnerName,
+    },
+  });
+
   await broadcastLeaderboard(ws.roomId);
+
+  // Send winner email only now that the auction for this item is truly over
+  if (item[0]?.winner_id) {
+    sendWinnerEmail(item[0].winner_id, itemId, item[0].winning_bid).catch(console.error);
+  }
 }
 
 async function handleRevealPrices(ws, msg) {
@@ -352,7 +374,7 @@ async function handleRevealPrices(ws, msg) {
   );
   broadcast(roomId, { type: "PRICES_REVEALED", data: { items } });
 
-  // Send leaderboard email
+  // Send leaderboard email to ALL participants
   await sendLeaderboardEmail(roomId);
 }
 
@@ -419,6 +441,7 @@ async function sendWinnerEmail(winnerId, itemId, amount) {
         <div style="font-family:sans-serif;background:#080808;color:#e0e0e0;padding:32px;border-radius:6px;max-width:500px;">
           <h2 style="color:#f5c518;">Congratulations ${user[0].name}!</h2>
           <p>You won <b>${item[0].name}</b> for <b>₹${amount} pts</b>.</p>
+          <p style="color:#888;font-size:13px;">Prices will be revealed by the admin at the end of the auction.</p>
         </div>
       `,
     });
@@ -448,8 +471,7 @@ async function sendLeaderboardEmail(roomId) {
       [roomId]
     );
 
-    // Build top 5 most profitable: profit = actual_price - winning_bid (lower bid = more profit)
-    // Only for items they won
+    // Top 5 most profitable leaderboard
     const { rows: profitBoard } = await pool.query(
       `SELECT u.name,
         SUM(i.actual_price - i.winning_bid) AS total_profit,
@@ -464,7 +486,6 @@ async function sendLeaderboardEmail(roomId) {
       [roomId]
     );
 
-    // Top 5 leaderboard HTML
     const medals = ["🥇", "🥈", "🥉", "4️⃣", "5️⃣"];
     const top5HTML = profitBoard.length ? profitBoard.map((r, i) => `
       <tr style="border-bottom:1px solid #1e1e1e;">
@@ -478,9 +499,8 @@ async function sendLeaderboardEmail(roomId) {
       </tr>`).join("") :
       `<tr><td colspan="5" style="padding:16px;color:#666;">No winners yet</td></tr>`;
 
-    // Send personalised email to each participant
+    // Send personalised email to EVERY participant
     for (const p of participants) {
-      // Build this player's P&L table
       const myItems = items.filter(i => String(i.winner_id) === String(p.id));
 
       const myItemsHTML = myItems.length ? myItems.map(i => {
@@ -506,18 +526,15 @@ async function sendLeaderboardEmail(roomId) {
 
       const html = `
         <div style="font-family:'Segoe UI',sans-serif;background:#080808;color:#e0e0e0;padding:0;max-width:640px;margin:0 auto;border:1px solid #1e1e1e;border-radius:6px;overflow:hidden;">
-          <!-- Header -->
           <div style="background:#0f0f0f;padding:32px;border-bottom:1px solid #1e1e1e;">
             <div style="font-family:monospace;font-size:32px;font-weight:bold;color:#f5c518;letter-spacing:6px;">BIDARENA</div>
             <div style="font-family:monospace;font-size:11px;color:#666;letter-spacing:3px;margin-top:4px;">FINAL RESULTS — ${room[0]?.name}</div>
           </div>
 
-          <!-- Greeting -->
           <div style="padding:24px 32px 0;">
             <p style="font-size:15px;color:#aaa;">Hey <strong style="color:#e8e8e8;">${p.name}</strong>, the auction has ended. Here's how you did:</p>
           </div>
 
-          <!-- My P&L -->
           ${myItems.length ? `
           <div style="padding:24px 32px;">
             <div style="font-family:monospace;font-size:11px;color:#666;letter-spacing:3px;margin-bottom:12px;">YOUR ITEMS</div>
@@ -532,13 +549,12 @@ async function sendLeaderboardEmail(roomId) {
               </thead>
               <tbody>${myItemsHTML}</tbody>
             </table>
-            <div style="margin-top:12px;padding:12px 16px;background:#0f0f0f;border:1px solid #1e1e1e;border-radius:4px;display:flex;justify-content:space-between;font-family:monospace;font-size:13px;">
+            <div style="margin-top:12px;padding:12px 16px;background:#0f0f0f;border:1px solid #1e1e1e;border-radius:4px;font-family:monospace;font-size:13px;display:flex;justify-content:space-between;">
               <span>Total spent: <strong style="color:#f5c518;">₹${totalSpent.toFixed(2)}</strong></span>
               <span>Net P&amp;L: <strong style="color:${profitColor};">${profitSign}₹${totalProfit.toFixed(2)}</strong></span>
             </div>
           </div>` : `<div style="padding:16px 32px;color:#666;font-size:13px;">You didn't win any items this round.</div>`}
 
-          <!-- Top 5 Most Profitable -->
           <div style="padding:8px 32px 32px;">
             <div style="font-family:monospace;font-size:11px;color:#666;letter-spacing:3px;margin-bottom:12px;">🏆 TOP 5 MOST PROFITABLE</div>
             <table style="width:100%;border-collapse:collapse;background:#0f0f0f;border-radius:4px;overflow:hidden;">
