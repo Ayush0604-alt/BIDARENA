@@ -108,43 +108,52 @@ async function sendMailWithRetry(mailOptions, retries = 3) {
 function setupWebSocket(server) {
   const wss = new WebSocket.Server({ server, path: "/ws" });
 
-  // Eagerly initialise the email transporter so problems show in startup logs
-  getTransporter().catch(() => {});
+  // Register LISTEN channels sequentially — concurrent listenTo() calls share
+  // one pg client and trigger "client already executing a query" warnings.
+  (async () => {
+    try {
+      // Eagerly verify email transporter so config problems appear at startup
+      await getTransporter().catch(() => {});
 
-  listenTo("bid_update", async (payload) => {
-    const { rows } = await pool.query("SELECT room_id FROM items WHERE id=$1", [payload.item_id]);
-    if (rows[0]) broadcast(rows[0].room_id, { type: "BID_UPDATE", data: payload });
-  });
-
-  listenTo("item_update", async (payload) => {
-    const { rows } = await pool.query("SELECT room_id FROM items WHERE id=$1", [payload.id]);
-    if (rows[0]) broadcast(rows[0].room_id, { type: "ITEM_UPDATE", data: payload });
-  });
-
-  listenTo("db_notifications", async (payload) => {
-    if (payload.type === "POINTS_RESET") {
-      const { rows: buyers } = await pool.query("SELECT id, points FROM users WHERE role='buyer'");
-      const buyerMap = {};
-      buyers.forEach(b => { buyerMap[String(b.id)] = b.points; });
-
-      broadcastAll({ type: "POINTS_RESET" });
-
-      Object.values(roomClients).forEach((clients) => {
-        clients.forEach((ws) => {
-          if (ws.readyState === WebSocket.OPEN && ws.userRole === "buyer") {
-            const newPts = buyerMap[String(ws.userId)];
-            if (newPts !== undefined) {
-              ws.send(JSON.stringify({ type: "POINTS_UPDATE", data: { points: newPts } }));
-            }
-          }
-        });
+      await listenTo("bid_update", async (payload) => {
+        const { rows } = await pool.query("SELECT room_id FROM items WHERE id=$1", [payload.item_id]);
+        if (rows[0]) broadcast(rows[0].room_id, { type: "BID_UPDATE", data: payload });
       });
 
-      Object.keys(roomClients).forEach(roomId => {
-        broadcastLeaderboard(roomId);
+      await listenTo("item_update", async (payload) => {
+        const { rows } = await pool.query("SELECT room_id FROM items WHERE id=$1", [payload.id]);
+        if (rows[0]) broadcast(rows[0].room_id, { type: "ITEM_UPDATE", data: payload });
       });
+
+      await listenTo("db_notifications", async (payload) => {
+        if (payload.type === "POINTS_RESET") {
+          const { rows: buyers } = await pool.query("SELECT id, points FROM users WHERE role='buyer'");
+          const buyerMap = {};
+          buyers.forEach(b => { buyerMap[String(b.id)] = b.points; });
+
+          broadcastAll({ type: "POINTS_RESET" });
+
+          Object.values(roomClients).forEach((clients) => {
+            clients.forEach((ws) => {
+              if (ws.readyState === WebSocket.OPEN && ws.userRole === "buyer") {
+                const newPts = buyerMap[String(ws.userId)];
+                if (newPts !== undefined) {
+                  ws.send(JSON.stringify({ type: "POINTS_UPDATE", data: { points: newPts } }));
+                }
+              }
+            });
+          });
+
+          Object.keys(roomClients).forEach(roomId => {
+            broadcastLeaderboard(roomId);
+          });
+        }
+      });
+
+    } catch (err) {
+      console.error("❌ Failed to set up DB listeners:", err.message);
     }
-  });
+  })();
 
   // Heartbeat — detect dead connections every 30s
   const heartbeatInterval = setInterval(() => {
@@ -307,7 +316,7 @@ async function handleJoinRoom(ws, roomId) {
   );
   broadcast(roomId, {
     type: "PARTICIPANT_COUNT",
-    data: { count: parseInt(pCount.rows[0]?.cnt || 0), maxPlayers: room[0].max_players || null }
+    data: { count: parseInt(pCount[0]?.cnt || 0), maxPlayers: room[0].max_players || null }
   });
 }
 
