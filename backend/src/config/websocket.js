@@ -81,6 +81,27 @@ async function sendMailWithRetry(mailOptions, retries = 3) {
   return false;
 }
 
+// ─── FIX #5: Per-item in-memory lock to prevent race conditions on simultaneous bids ───
+// Two buyers hitting PLACE_BID at the same millisecond would both pass the
+// `amount > currentHigh` check before either one commits. The lock serialises
+// bid processing per item so only one runs at a time.
+const itemLocks = new Map();
+
+async function withItemLock(itemId, fn) {
+  const prev = itemLocks.get(itemId) || Promise.resolve();
+  let resolve;
+  const next = new Promise(r => (resolve = r));
+  itemLocks.set(itemId, next);
+  try {
+    await prev;
+    return await fn();
+  } finally {
+    resolve();
+    // Clean up the map entry once no further lock is chained to this promise
+    if (itemLocks.get(itemId) === next) itemLocks.delete(itemId);
+  }
+}
+
 // ─── WEBSOCKET SETUP ───────────────────────────────────────────────────────
 function setupWebSocket(server) {
   const wss = new WebSocket.Server({ server, path: "/ws" });
@@ -160,8 +181,24 @@ function setupWebSocket(server) {
       }
     });
 
-    ws.on("close", () => {
-      if (ws.roomId && roomClients[ws.roomId]) roomClients[ws.roomId].delete(ws);
+    // ─── FIX #3: Reset room-scoped points on disconnect ──────────────────────
+    // When a buyer leaves, restore their points to 10,000 so they start fresh
+    // if they rejoin later. Only applies to buyers (admins have no room points).
+    ws.on("close", async () => {
+      if (ws.roomId && roomClients[ws.roomId]) {
+        roomClients[ws.roomId].delete(ws);
+      }
+
+      if (ws.roomId && ws.userRole !== "admin") {
+        try {
+          await pool.query(
+            "UPDATE room_player_points SET points = 10000 WHERE room_id=$1 AND user_id=$2",
+            [ws.roomId, ws.userId]
+          );
+        } catch (err) {
+          console.error("Failed to reset points on disconnect:", err.message);
+        }
+      }
     });
 
     ws.on("error", (err) => console.error("WS client error:", err.message));
@@ -327,115 +364,128 @@ function notifyPoints(roomId, userId, points) {
 }
 
 async function handlePlaceBid(ws, msg) {
-  if (ws.isSpectator) {
-    return ws.send(JSON.stringify({ type: "BID_REJECTED", reason: "Spectators cannot place bids" }));
-  }
-  const { itemId, amount } = msg;
-  const roomId = ws.roomId;
+  // FIX #5: Wrap entire bid logic in a per-item lock to serialise concurrent bids.
+  // Without this, two buyers hitting PLACE_BID at the same millisecond can both
+  // pass the `amount > currentHigh` check before either one commits to the DB.
+  return withItemLock(msg.itemId, async () => {
 
-  const { rows } = await pool.query("SELECT * FROM items WHERE id=$1", [itemId]);
-  const item = rows[0];
-  if (!item || item.status !== "active") {
-    return ws.send(JSON.stringify({ type: "BID_REJECTED", reason: "Item not active" }));
-  }
-
-  // Rate limiting
-  const now = Date.now();
-  if (!bidRateLimits[ws.userId] || now - bidRateLimits[ws.userId].firstHit > 10000) {
-    bidRateLimits[ws.userId] = { count: 1, firstHit: now };
-  } else if (++bidRateLimits[ws.userId].count > 8) {
-    return ws.send(JSON.stringify({ type: "BID_REJECTED", reason: "Too many bids — please wait." }));
-  }
-
-  const bidAmount = parseFloat(amount);
-  if (isNaN(bidAmount) || bidAmount < 1) {
-    return ws.send(JSON.stringify({ type: "BID_REJECTED", reason: "Minimum bid is 1 point" }));
-  }
-
-  // Current high bid
-  const window = activeBidWindows[itemId];
-  const currentHigh = window?.amount || 0;
-
-  if (bidAmount <= currentHigh) {
-    return ws.send(JSON.stringify({
-      type: "BID_REJECTED",
-      reason: `Bid must exceed current high of ₹${currentHigh}`
-    }));
-  }
-
-  // Can't outbid yourself
-  if (window && String(window.highBidderId) === String(ws.userId)) {
-    return ws.send(JSON.stringify({
-      type: "BID_REJECTED",
-      reason: "You are already the highest bidder"
-    }));
-  }
-
-  // Check room-scoped points
-  const availablePoints = await getRoomPoints(roomId, ws.userId);
-  if (bidAmount > availablePoints) {
-    return ws.send(JSON.stringify({
-      type: "BID_REJECTED",
-      reason: `Insufficient points (you have ₹${availablePoints.toFixed(0)} pts in this room)`
-    }));
-  }
-
-  // Refund previous high bidder
-  if (window && window.highBidderId) {
-    const refunded = await refundRoomPoints(roomId, window.highBidderId, window.amount);
-    notifyPoints(roomId, window.highBidderId, refunded);
-    // Clear the old countdown
-    if (window.timeout) clearTimeout(window.timeout);
-  }
-
-  // Deduct new bidder
-  const newPoints = await deductRoomPoints(roomId, ws.userId, bidAmount);
-  notifyPoints(roomId, ws.userId, newPoints);
-
-  // Record bid in DB
-  await pool.query(
-    "INSERT INTO bids(item_id, user_id, amount) VALUES($1, $2, $3)",
-    [itemId, ws.userId, bidAmount]
-  );
-  await pool.query(
-    "UPDATE items SET winner_id=$1, winning_bid=$2 WHERE id=$3",
-    [ws.userId, bidAmount, itemId]
-  );
-
-  const startedAt = Date.now();
-
-  // Start / reset 15-second countdown
-  const timeout = setTimeout(async () => {
-    // Timer fired — no new bid came in — auto-close
-    const w = activeBidWindows[itemId];
-    if (!w) return; // already finalized
-    const { rows: check } = await pool.query("SELECT status FROM items WHERE id=$1", [itemId]);
-    if (check[0]?.status !== "active") return;
-    await finalizeItem(itemId, roomId, parseInt(w.highBidderId), w.highBidderName, w.amount, "timeout");
-  }, BID_WINDOW_SECS * 1000);
-
-  activeBidWindows[itemId] = {
-    highBidderId: String(ws.userId),
-    highBidderName: ws.userName,
-    amount: bidAmount,
-    timeout,
-    startedAt,
-  };
-
-  // Broadcast to all in room
-  broadcast(roomId, {
-    type: "BID_PLACED",
-    data: {
-      itemId,
-      userId: ws.userId,
-      userName: ws.userName,
-      amount: bidAmount,
-      countdownSecs: BID_WINDOW_SECS,
-      startedAt,
+    if (ws.isSpectator) {
+      return ws.send(JSON.stringify({ type: "BID_REJECTED", reason: "Spectators cannot place bids" }));
     }
-  });
+    const { itemId, amount } = msg;
+    const roomId = ws.roomId;
 
-  await broadcastLeaderboard(roomId);
+    const { rows } = await pool.query("SELECT * FROM items WHERE id=$1", [itemId]);
+    const item = rows[0];
+    if (!item || item.status !== "active") {
+      return ws.send(JSON.stringify({ type: "BID_REJECTED", reason: "Item not active" }));
+    }
+
+    // Rate limiting
+    const now = Date.now();
+    if (!bidRateLimits[ws.userId] || now - bidRateLimits[ws.userId].firstHit > 10000) {
+      bidRateLimits[ws.userId] = { count: 1, firstHit: now };
+    } else if (++bidRateLimits[ws.userId].count > 8) {
+      return ws.send(JSON.stringify({ type: "BID_REJECTED", reason: "Too many bids — please wait." }));
+    }
+
+    const bidAmount = parseFloat(amount);
+
+    // FIX #4: Validate bid is a finite number and within the allowed range.
+    // This catches floats like 9999999999, NaN, Infinity, etc.
+    if (!Number.isFinite(bidAmount) || bidAmount < 1 || bidAmount > 10000) {
+      return ws.send(JSON.stringify({
+        type: "BID_REJECTED",
+        reason: "Bid must be between 1 and 10,000 points"
+      }));
+    }
+
+    // Current high bid
+    const window = activeBidWindows[itemId];
+    const currentHigh = window?.amount || 0;
+
+    if (bidAmount <= currentHigh) {
+      return ws.send(JSON.stringify({
+        type: "BID_REJECTED",
+        reason: `Bid must exceed current high of ₹${currentHigh}`
+      }));
+    }
+
+    // Can't outbid yourself
+    if (window && String(window.highBidderId) === String(ws.userId)) {
+      return ws.send(JSON.stringify({
+        type: "BID_REJECTED",
+        reason: "You are already the highest bidder"
+      }));
+    }
+
+    // Check room-scoped points
+    const availablePoints = await getRoomPoints(roomId, ws.userId);
+    if (bidAmount > availablePoints) {
+      return ws.send(JSON.stringify({
+        type: "BID_REJECTED",
+        reason: `Insufficient points (you have ₹${availablePoints.toFixed(0)} pts in this room)`
+      }));
+    }
+
+    // Refund previous high bidder
+    if (window && window.highBidderId) {
+      const refunded = await refundRoomPoints(roomId, window.highBidderId, window.amount);
+      notifyPoints(roomId, window.highBidderId, refunded);
+      // Clear the old countdown
+      if (window.timeout) clearTimeout(window.timeout);
+    }
+
+    // Deduct new bidder
+    const newPoints = await deductRoomPoints(roomId, ws.userId, bidAmount);
+    notifyPoints(roomId, ws.userId, newPoints);
+
+    // Record bid in DB
+    await pool.query(
+      "INSERT INTO bids(item_id, user_id, amount) VALUES($1, $2, $3)",
+      [itemId, ws.userId, bidAmount]
+    );
+    await pool.query(
+      "UPDATE items SET winner_id=$1, winning_bid=$2 WHERE id=$3",
+      [ws.userId, bidAmount, itemId]
+    );
+
+    const startedAt = Date.now();
+
+    // Start / reset 15-second countdown
+    const timeout = setTimeout(async () => {
+      // Timer fired — no new bid came in — auto-close
+      const w = activeBidWindows[itemId];
+      if (!w) return; // already finalized
+      const { rows: check } = await pool.query("SELECT status FROM items WHERE id=$1", [itemId]);
+      if (check[0]?.status !== "active") return;
+      await finalizeItem(itemId, roomId, parseInt(w.highBidderId), w.highBidderName, w.amount, "timeout");
+    }, BID_WINDOW_SECS * 1000);
+
+    activeBidWindows[itemId] = {
+      highBidderId: String(ws.userId),
+      highBidderName: ws.userName,
+      amount: bidAmount,
+      timeout,
+      startedAt,
+    };
+
+    // Broadcast to all in room
+    broadcast(roomId, {
+      type: "BID_PLACED",
+      data: {
+        itemId,
+        userId: ws.userId,
+        userName: ws.userName,
+        amount: bidAmount,
+        countdownSecs: BID_WINDOW_SECS,
+        startedAt,
+      }
+    });
+
+    await broadcastLeaderboard(roomId);
+
+  }); // end withItemLock
 }
 
 // ─── FINALIZE ──────────────────────────────────────────────────────────────
