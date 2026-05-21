@@ -297,7 +297,9 @@ async function handleJoinRoom(ws, roomId) {
       topBids,
       isSpectator: ws.isSpectator,
       activeCountdowns,
-      maxPlayers: room[0].max_players || null
+      maxPlayers: room[0].max_players || null,
+      // Fix #3: include server timestamp so client can compute clock offset
+      serverTime: Date.now(),
     }
   }));
 

@@ -22,6 +22,7 @@ const state = {
   roomPoints: 0,           // room-scoped points — fresh 10000 each room
   activeCountdowns: {},    // itemId -> { interval, remaining, total }
   leaderboardInterval: null,
+  clockOffset: 0,          // Fix #3: server-client clock skew compensation
   _wsReconnectAttempt: 0,
   _wsReconnectTimer: null,
   _wsIntentionalClose: false,
@@ -170,7 +171,8 @@ function renderNavUser() {
   updateRoomPointsDisplay();
 }
 
-// ─── LEADERBOARD POLLING (fallback) ────────────
+// ─── LEADERBOARD POLLING (fallback when WS is disconnected) ────────────────
+// Fix #5: polling now only runs when WS is down; onopen stops it, onclose starts it.
 function startLeaderboardPolling(roomId) {
   stopLeaderboardPolling();
   state.leaderboardInterval = setInterval(async () => {
@@ -318,6 +320,10 @@ function renderRooms(rooms) {
   }
   grid.innerHTML = rooms.map(r => {
     const isFull = r.max_players && parseInt(r.participant_count) >= r.max_players && r.status === "waiting";
+    // Fix #4: spectator warning for active rooms
+    const spectatorWarning = r.status === "active"
+      ? `<div style="font-family:var(--mono);font-size:11px;color:var(--text-dim);margin-top:6px;">⚠ Joining now puts you in spectator mode — bidding is locked</div>`
+      : "";
     return `
     <div class="room-card" onclick="joinRoom(${r.id})">
       ${state.user?.role === "admin" ? `
@@ -330,6 +336,7 @@ function renderRooms(rooms) {
         <span>📦 ${r.item_count} items</span>
       </div>
       <div class="room-status status-${r.status}">${r.status.toUpperCase()}${isFull?" — FULL":""}</div>
+      ${spectatorWarning}
     </div>`
   }).join("");
 }
@@ -369,6 +376,7 @@ async function joinRoom(roomId) {
     state.topBids = {};
     state.roomPoints = 0; // will be set by ROOM_POINTS event
     state.activeCountdowns = {};
+    state.clockOffset = 0; // reset clock offset on fresh join
     data.topBids.forEach(b => {
       state.topBids[b.item_id] = { userId: b.user_id, userName: b.user_name, amount: b.amount };
     });
@@ -384,7 +392,7 @@ async function joinRoom(roomId) {
     showPage("page-arena");
     renderNavUser(); // show points in nav now
     connectWebSocket(roomId);
-    startLeaderboardPolling(roomId);
+    // Fix #5: leaderboard polling removed from joinRoom — WS onopen/onclose manages it
   } catch (err) { toast("Failed to join room: " + err.message, "error"); }
 }
 
@@ -480,6 +488,22 @@ function renderItems() {
 
     const nextMin = topBid ? (parseFloat(topBid.amount) + 1).toFixed(0) : "100";
 
+    // Fix #2: bid history shown for BOTH active and finished items (if bids exist)
+    const hasBidHistory = state.allBids[item.id] && state.allBids[item.id].length > 0;
+    const bidHistoryHTML = (isActive || isFinished) && hasBidHistory ? `
+      <div class="bid-history">
+        <div class="bid-history-title" onclick="document.getElementById('bid-hist-${item.id}').classList.toggle('open')">
+          <span>BID HISTORY (${state.allBids[item.id].length})</span><span>▼</span>
+        </div>
+        <div class="bid-history-list" id="bid-hist-${item.id}">
+          ${state.allBids[item.id].map(b => `
+            <div class="bid-history-item">
+              <span>${escapeHTML(b.user_name)}</span>
+              <span>${formatCurrency(b.amount)}</span>
+            </div>`).join("")}
+        </div>
+      </div>` : "";
+
     return `
     <div class="item-card ${isActive?"active-item":""} ${isFinished?"finished-item":""}" id="item-card-${item.id}">
       <div class="item-number">ITEM ${String(idx+1).padStart(2,"0")} / ${String(state.currentItems.length).padStart(2,"0")}</div>
@@ -523,19 +547,7 @@ function renderItems() {
         `}
       ` : ""}
 
-      ${isFinished && state.allBids[item.id] && state.allBids[item.id].length > 0 ? `
-        <div class="bid-history">
-          <div class="bid-history-title" onclick="document.getElementById('bid-hist-${item.id}').classList.toggle('open')">
-            <span>BID HISTORY (${state.allBids[item.id].length})</span><span>▼</span>
-          </div>
-          <div class="bid-history-list" id="bid-hist-${item.id}">
-            ${state.allBids[item.id].map(b => `
-              <div class="bid-history-item">
-                <span>${escapeHTML(b.user_name)}</span>
-                <span>${formatCurrency(b.amount)}</span>
-              </div>`).join("")}
-          </div>
-        </div>` : ""}
+      ${bidHistoryHTML}
 
       ${isAdmin ? `
         <div class="admin-controls">
@@ -554,7 +566,8 @@ function startItemCountdown(itemId, totalSecs, startedAt) {
     clearInterval(state.activeCountdowns[itemId].intervalHandle);
   }
 
-  const elapsed = startedAt ? (Date.now() - startedAt) / 1000 : 0;
+  // Fix #3: apply server-client clock offset when computing elapsed time
+  const elapsed = startedAt ? ((Date.now() + (state.clockOffset || 0)) - startedAt) / 1000 : 0;
   let remaining = Math.max(0, Math.ceil(totalSecs - elapsed));
 
   state.activeCountdowns[itemId] = { remaining, total: totalSecs, startedAt };
@@ -616,6 +629,8 @@ function _connectWS(roomId) {
     state._wsReconnectAttempt = 0; setWsDot("connected");
     ws.send(JSON.stringify({ type: "JOIN_ROOM", roomId }));
     addFeed("Connected to arena", "system");
+    // Fix #5: stop polling when WS is up — server pushes leaderboard via WS
+    stopLeaderboardPolling();
   };
   ws.onclose = (evt) => {
     setWsDot("error");
@@ -625,11 +640,17 @@ function _connectWS(roomId) {
     const attempt = ++state._wsReconnectAttempt;
     const delay = Math.min(1000 * Math.pow(2, attempt-1), 30000);
     addFeed(`Disconnected — reconnecting in ${(delay/1000).toFixed(0)}s…`, "system");
+    // Fix #5: start polling when WS drops so leaderboard stays fresh
+    startLeaderboardPolling(roomId);
     state._wsReconnectTimer = setTimeout(() => {
       if (!state._wsIntentionalClose && state.currentRoom?.id === roomId) _connectWS(roomId);
     }, delay);
   };
-  ws.onerror = () => setWsDot("error");
+  // Fix #1: show user-facing toast on WS error
+  ws.onerror = () => {
+    setWsDot("error");
+    toast("Connection error — reconnecting...", "error");
+  };
   ws.onmessage = (e) => { let msg; try { msg = JSON.parse(e.data); } catch { return; } handleWsMessage(msg); };
 }
 function setWsDot(status) {
@@ -652,6 +673,10 @@ function handleWsMessage(msg) {
       msg.data.topBids.forEach(b => {
         state.topBids[b.item_id] = { userId: b.user_id, userName: b.user_name || "?", amount: b.amount };
       });
+      // Fix #3: compute clock offset from server timestamp in snapshot
+      if (msg.data.serverTime) {
+        state.clockOffset = msg.data.serverTime - Date.now();
+      }
       // Restore any active countdowns
       if (msg.data.activeCountdowns) {
         for (const [itemId, cd] of Object.entries(msg.data.activeCountdowns)) {
@@ -680,6 +705,11 @@ function handleWsMessage(msg) {
     case "BID_PLACED": {
       const { itemId, userId, userName, amount, countdownSecs, startedAt } = msg.data;
 
+      // Fix #6: detect if the current user is being outbid
+      const wasMyBid = state.topBids[itemId] && String(state.topBids[itemId].userId) === String(state.user?.id);
+      const isNowSomeoneElse = String(userId) !== String(state.user?.id);
+      if (wasMyBid && isNowSomeoneElse) playSound("error");
+
       // Update top bid display
       state.topBids[itemId] = { userId, userName, amount };
       const amtEl = $(`bid-amount-${itemId}`);
@@ -702,8 +732,28 @@ function handleWsMessage(msg) {
       // Start / reset countdown
       startItemCountdown(itemId, countdownSecs || 15, startedAt || Date.now());
 
+      // Refresh bid history panel in-place for active items (Fix #2)
+      const histList = $(`bid-hist-${itemId}`);
+      if (histList) {
+        histList.innerHTML = state.allBids[itemId].map(b => `
+          <div class="bid-history-item">
+            <span>${escapeHTML(b.user_name)}</span>
+            <span>${formatCurrency(b.amount)}</span>
+          </div>`).join("");
+        // Update count in title
+        const histTitle = histList.previousElementSibling;
+        if (histTitle) {
+          const span = histTitle.querySelector("span");
+          if (span) span.textContent = `BID HISTORY (${state.allBids[itemId].length})`;
+        }
+      } else {
+        // Panel doesn't exist yet for this active item — do a targeted re-render
+        const card = $(`item-card-${itemId}`);
+        if (card) renderItems(); // fallback: full re-render if panel not yet in DOM
+      }
+
       addFeed(`<b>${escapeHTML(userName)}</b> bid ${formatCurrency(amount)} — 15s clock reset`, "bid");
-      playSound("tick");
+      if (!wasMyBid || !isNowSomeoneElse) playSound("tick"); // only tick if NOT outbid sound
       break;
     }
 
@@ -937,7 +987,7 @@ function backToLobby() {
   // Clear all countdowns
   for (const itemId of Object.keys(state.activeCountdowns)) clearItemCountdown(parseInt(itemId));
   state.currentRoom = null; state.currentItems = []; state.topBids = {};
-  state.roomPoints = 0; state.activeCountdowns = {};
+  state.roomPoints = 0; state.activeCountdowns = {}; state.clockOffset = 0;
   showLobby();
 }
 
