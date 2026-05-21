@@ -7,7 +7,7 @@ const getRooms = async (req, res, next) => {
       `SELECT r.*, u.name as creator_name,
         (SELECT COUNT(*) FROM room_participants rp
          JOIN users u2 ON u2.id=rp.user_id
-         WHERE rp.room_id=r.id AND u2.role != 'admin' AND rp.is_spectator=FALSE) as participant_count,
+         WHERE rp.room_id=r.id AND u2.role!='admin' AND rp.is_spectator=FALSE) as participant_count,
         (SELECT COUNT(*) FROM items i WHERE i.room_id=r.id) as item_count
        FROM rooms r JOIN users u ON u.id=r.created_by
        ORDER BY r.created_at DESC`
@@ -16,8 +16,7 @@ const getRooms = async (req, res, next) => {
   } catch (err) { next(err); }
 };
 
-// POST /api/v1/rooms — admin creates a room
-// FIX: accept max_players from body
+// POST /api/v1/rooms
 const createRoom = async (req, res, next) => {
   const { name, max_players } = req.body;
   try {
@@ -37,24 +36,21 @@ const getRoom = async (req, res, next) => {
     if (!room[0]) return res.status(404).json({ success: false, message: "Room not found" });
 
     const { rows: items } = await pool.query(
-      "SELECT * FROM items WHERE room_id=$1 ORDER BY display_order",
-      [req.params.id]
+      "SELECT * FROM items WHERE room_id=$1 ORDER BY display_order", [req.params.id]
     );
-
     const { rows: topBids } = await pool.query(
       `SELECT DISTINCT ON (b.item_id) b.item_id, b.user_id, b.amount, u.name as user_name
        FROM bids b JOIN users u ON u.id=b.user_id
        WHERE b.item_id = ANY($1::int[])
        ORDER BY b.item_id, b.amount DESC`,
-      [items.map((i) => i.id)]
+      [items.map(i => i.id)]
     );
-
     const { rows: allBids } = await pool.query(
       `SELECT b.item_id, b.user_id, b.amount, b.created_at, u.name as user_name
        FROM bids b JOIN users u ON u.id=b.user_id
        WHERE b.item_id = ANY($1::int[])
        ORDER BY b.item_id, b.amount DESC`,
-      [items.map((i) => i.id)]
+      [items.map(i => i.id)]
     );
 
     res.json({ success: true, room: room[0], items, topBids, allBids });
@@ -89,30 +85,25 @@ const getLeaderboard = async (req, res, next) => {
     const { rows: room } = await pool.query("SELECT status FROM rooms WHERE id=$1", [roomId]);
     const isFinished = room[0]?.status === "finished";
 
-    let rows;
-    if (isFinished) {
-      const result = await pool.query(
-        `SELECT u.id, u.name, rp.total_spent, rp.items_won,
-                (10000 - rp.total_spent + COALESCE((
-                   SELECT SUM(actual_price) FROM items WHERE room_id=$1 AND winner_id=u.id
-                ), 0)) as net_worth
-         FROM room_participants rp JOIN users u ON u.id=rp.user_id
-         WHERE rp.room_id=$1 AND rp.is_spectator = FALSE AND u.role != 'admin'
-         ORDER BY net_worth DESC LIMIT 10`,
-        [roomId]
-      );
-      rows = result.rows;
-    } else {
-      const result = await pool.query(
-        `SELECT u.id, u.name, rp.total_spent, rp.items_won,
-                (10000 - rp.total_spent) as net_worth
-         FROM room_participants rp JOIN users u ON u.id=rp.user_id
-         WHERE rp.room_id=$1 AND rp.is_spectator = FALSE AND u.role != 'admin'
-         ORDER BY net_worth DESC LIMIT 10`,
-        [roomId]
-      );
-      rows = result.rows;
-    }
+    const q = isFinished
+      ? `SELECT u.id, u.name, rp.total_spent, rp.items_won,
+                COALESCE(rpp.points,0) + COALESCE((
+                  SELECT SUM(i.actual_price) FROM items i WHERE i.room_id=$1 AND i.winner_id=u.id
+                ),0) AS net_worth
+         FROM room_participants rp
+         JOIN users u ON u.id=rp.user_id
+         LEFT JOIN room_player_points rpp ON rpp.room_id=rp.room_id AND rpp.user_id=u.id
+         WHERE rp.room_id=$1 AND rp.is_spectator=FALSE AND u.role!='admin'
+         ORDER BY net_worth DESC LIMIT 10`
+      : `SELECT u.id, u.name, rp.total_spent, rp.items_won,
+                COALESCE(rpp.points,0) AS net_worth
+         FROM room_participants rp
+         JOIN users u ON u.id=rp.user_id
+         LEFT JOIN room_player_points rpp ON rpp.room_id=rp.room_id AND rpp.user_id=u.id
+         WHERE rp.room_id=$1 AND rp.is_spectator=FALSE AND u.role!='admin'
+         ORDER BY net_worth DESC LIMIT 10`;
+
+    const { rows } = await pool.query(q, [roomId]);
     res.json({ success: true, leaderboard: rows });
   } catch (err) { next(err); }
 };
@@ -125,18 +116,16 @@ const deleteRoom = async (req, res, next) => {
   } catch (err) { next(err); }
 };
 
-// POST /api/v1/rooms/reset-points
-// FIX: After reset, re-fetch user points from DB so the response confirms success
+// POST /api/v1/rooms/reset-points — resets room-scoped points for all buyers in all rooms
 const resetPoints = async (req, res, next) => {
   try {
-    await pool.query("UPDATE users SET points=10000 WHERE role='buyer'");
-    // FIX: Use pg_notify to trigger all connected WS clients to update
+    await pool.query("UPDATE room_player_points SET points=10000");
     await pool.query(`SELECT pg_notify('db_notifications', '{"type":"POINTS_RESET"}')`);
-    res.json({ success: true, message: "All buyers reset to 10,000 pts" });
+    res.json({ success: true, message: "All room points reset to 10,000" });
   } catch (err) { next(err); }
 };
 
-// PATCH /api/v1/rooms/:id — update room settings (e.g. max_players)
+// PATCH /api/v1/rooms/:id
 const updateRoom = async (req, res, next) => {
   try {
     const { max_players } = req.body;

@@ -16,41 +16,29 @@ let reconnectTimer = null;
 
 async function getListenerClient() {
   if (listenerClient) return listenerClient;
-
   listenerClient = await pool.connect();
 
   listenerClient.on("notification", (msg) => {
     let payload;
     try { payload = JSON.parse(msg.payload); } catch { payload = msg.payload; }
     const cbs = listenerCallbacks[msg.channel] || [];
-    cbs.forEach((cb) => {
-      try { cb(payload); } catch (err) {
-        console.error(`Listener callback error on channel ${msg.channel}:`, err.message);
-      }
-    });
+    cbs.forEach((cb) => { try { cb(payload); } catch (e) { console.error("Listener cb error:", e.message); } });
   });
 
   listenerClient.on("error", (err) => {
     console.error("⚠️  Listener client error:", err.message, "— reconnecting in 5s…");
     listenerClient = null;
-    // Re-subscribe all channels on reconnect
     if (!reconnectTimer) {
       reconnectTimer = setTimeout(async () => {
         reconnectTimer = null;
-        try {
-          await rebuildListenerClient();
-        } catch (e) {
-          console.error("Listener reconnect failed:", e.message);
-        }
+        try { await rebuildListenerClient(); } catch (e) { console.error("Listener reconnect failed:", e.message); }
       }, 5000);
     }
   });
 
-  // Re-LISTEN to all previously subscribed channels
   for (const channel of subscribedChannels) {
     await listenerClient.query(`LISTEN "${channel}"`);
   }
-
   return listenerClient;
 }
 
@@ -63,11 +51,8 @@ async function rebuildListenerClient() {
 }
 
 async function listenTo(channel, callback) {
-  if (!listenerCallbacks[channel]) {
-    listenerCallbacks[channel] = [];
-  }
+  if (!listenerCallbacks[channel]) listenerCallbacks[channel] = [];
   listenerCallbacks[channel].push(callback);
-
   if (!subscribedChannels.has(channel)) {
     subscribedChannels.add(channel);
     const client = await getListenerClient();
@@ -75,7 +60,7 @@ async function listenTo(channel, callback) {
   }
 }
 
-// ─── SCHEMA ────────────────────────────────────────────────────────────────
+// ─── CONNECT & SCHEMA ──────────────────────────────────────────────────────
 async function connectDB() {
   try {
     await pool.query("SELECT 1");
@@ -88,16 +73,12 @@ async function connectDB() {
 }
 
 async function initSchema() {
-  // Safe migrations first (ALTER TABLE IF NOT EXISTS)
+  // Safe column migrations
   const migrations = [
-    `ALTER TABLE users ADD COLUMN IF NOT EXISTS points NUMERIC(12,2) DEFAULT 10000`,
     `ALTER TABLE rooms ADD COLUMN IF NOT EXISTS max_players INT DEFAULT NULL`,
     `ALTER TABLE room_participants ADD COLUMN IF NOT EXISTS is_spectator BOOLEAN DEFAULT FALSE`,
   ];
-
-  for (const sql of migrations) {
-    await pool.query(sql).catch(() => {}); // Ignore errors on already-existing columns
-  }
+  for (const sql of migrations) await pool.query(sql).catch(() => {});
 
   await pool.query(`
     CREATE TABLE IF NOT EXISTS users (
@@ -106,7 +87,6 @@ async function initSchema() {
       email      TEXT UNIQUE NOT NULL,
       password   TEXT NOT NULL,
       role       TEXT DEFAULT 'buyer' CHECK (role IN ('admin','buyer')),
-      points     NUMERIC(12,2) DEFAULT 10000,
       created_at TIMESTAMPTZ DEFAULT NOW()
     );
 
@@ -149,6 +129,16 @@ async function initSchema() {
       total_spent  NUMERIC(12,2) DEFAULT 0,
       items_won    INT DEFAULT 0,
       is_spectator BOOLEAN DEFAULT FALSE,
+      PRIMARY KEY (room_id, user_id)
+    );
+
+    -- Room-scoped points: fresh 10,000 per player per room session
+    -- Points are deducted when bidding and refunded when outbid.
+    -- They do NOT persist to the users table.
+    CREATE TABLE IF NOT EXISTS room_player_points (
+      room_id  INT REFERENCES rooms(id) ON DELETE CASCADE,
+      user_id  INT REFERENCES users(id),
+      points   NUMERIC(12,2) NOT NULL DEFAULT 10000,
       PRIMARY KEY (room_id, user_id)
     );
 
